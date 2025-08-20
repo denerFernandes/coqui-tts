@@ -24,6 +24,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* /root/.cache \
     && pip cache purge
 
+RUN echo "y" | python -c "from TTS.api import TTS; TTS('tts_models/multilingual/multi-dataset/xtts_v2', gpu=False)" || true
+
 COPY server.py .
 
 EXPOSE 8000
