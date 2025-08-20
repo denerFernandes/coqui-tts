@@ -447,44 +447,214 @@ def trim_warmup_from_audio(audio_path: str, output_path: str, warmup_word_count:
         logger.error(f"❌ Erro ao remover aquecimento: {e}")
         return False
 
-def improve_audio_start(audio_path: str, output_path: str) -> bool:
-    """Melhorar qualidade do início do áudio"""
+def improve_audio_start_simple(audio_path: str, output_path: str) -> bool:
+    """Melhoria simples do início do áudio (quando não há artefatos graves)"""
     try:
         audio_data, sr = sf.read(audio_path)
         
-        # Parâmetros para melhoria do início
-        start_improvement_duration = 1.0  # primeiros 1 segundo
-        start_samples = int(start_improvement_duration * sr)
+        # Aplicar fade-in suave apenas
+        fade_duration = 0.1  # 100ms
+        fade_samples = int(fade_duration * sr)
+        fade_samples = min(fade_samples, len(audio_data) // 4)  # Máximo 25% do áudio
         
-        if len(audio_data) > start_samples:
-            # Aplicar filtro suave no início para reduzir artefatos
-            start_segment = audio_data[:start_samples].copy()
+        if fade_samples > 0:
+            fade_curve = np.linspace(0, 1, fade_samples) ** 1.5  # Curva suave
+            audio_data[:fade_samples] *= fade_curve
+        
+        sf.write(output_path, audio_data, sr)
+        logger.info("🎛️ Fade-in suave aplicado ao início")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Erro ao aplicar fade-in: {e}")
+        return False
+
+def detect_and_fix_audio_artifacts(audio_path: str, output_path: str) -> bool:
+    """Detectar e corrigir artefatos no início do áudio (clicks, pops, barulhos)"""
+    try:
+        audio_data, sr = sf.read(audio_path)
+        
+        # Parâmetros para detecção de artefatos
+        initial_duration = 1.0  # Primeiros 1 segundo
+        initial_samples = int(initial_duration * sr)
+        
+        if len(audio_data) < initial_samples:
+            initial_samples = len(audio_data)
+        
+        # Analisar o início do áudio
+        start_segment = audio_data[:initial_samples].copy()
+        
+        # 1. Detectar clicks/pops (mudanças bruscas de amplitude)
+        diff = np.diff(start_segment)
+        click_threshold = np.std(diff) * 5  # 5x o desvio padrão
+        clicks = np.abs(diff) > click_threshold
+        
+        if np.any(clicks):
+            logger.info(f"🔧 Detectados {np.sum(clicks)} clicks/pops no início")
             
-            # Suavização com média móvel
-            window_size = int(0.01 * sr)  # janela de 10ms
-            if window_size > 1:
-                kernel = np.ones(window_size) / window_size
-                start_segment = np.convolve(start_segment, kernel, mode='same')
+            # Suavizar clicks detectados
+            click_indices = np.where(clicks)[0]
+            for idx in click_indices:
+                # Suavizar numa janela pequena ao redor do click
+                window_start = max(0, idx - 5)
+                window_end = min(len(start_segment), idx + 6)
+                
+                if window_end > window_start + 1:
+                    # Interpolação linear para suavizar
+                    start_val = start_segment[window_start] if window_start > 0 else 0
+                    end_val = start_segment[window_end-1] if window_end < len(start_segment) else start_segment[-1]
+                    
+                    # Interpolação suave
+                    window_size = window_end - window_start
+                    interpolated = np.linspace(start_val, end_val, window_size)
+                    start_segment[window_start:window_end] = interpolated
+        
+        # 2. Aplicar fade-in muito suave e longo
+        fade_duration = 0.3  # 300ms de fade-in
+        fade_samples = int(fade_duration * sr)
+        fade_samples = min(fade_samples, len(start_segment))
+        
+        if fade_samples > 0:
+            # Curva de fade-in suave (não linear)
+            fade_curve = np.linspace(0, 1, fade_samples) ** 2  # Curva quadrática suave
+            start_segment[:fade_samples] *= fade_curve
+        
+        # 3. Remover DC offset (componente contínua que pode causar pop)
+        dc_offset = np.mean(start_segment[:min(1000, len(start_segment))])
+        if abs(dc_offset) > 0.01:
+            start_segment -= dc_offset
+            logger.info(f"🔧 DC offset removido: {dc_offset:.4f}")
+        
+        # 4. Aplicar filtro passa-alta suave para remover ruído baixo
+        from scipy import signal
+        
+        nyquist = sr / 2
+        low_cutoff = 40 / nyquist  # Cortar frequências abaixo de 40Hz
+        
+        if low_cutoff < 0.99:
+            b, a = signal.butter(1, low_cutoff, btype='high')  # Filtro suave (ordem 1)
+            start_segment = signal.filtfilt(b, a, start_segment)
+        
+        # 5. Normalizar suavemente
+        max_val = np.max(np.abs(start_segment))
+        if max_val > 0:
+            # Normalizar para 90% para evitar saturação
+            start_segment = start_segment * (0.90 / max_val)
+        
+        # Reconstruir o áudio completo
+        cleaned_audio = audio_data.copy()
+        cleaned_audio[:initial_samples] = start_segment
+        
+        # Aplicar crossfade entre o início limpo e o resto do áudio
+        if len(audio_data) > initial_samples:
+            crossfade_duration = 0.1  # 100ms de crossfade
+            crossfade_samples = int(crossfade_duration * sr)
+            crossfade_samples = min(crossfade_samples, initial_samples // 2)
             
-            # Aplicar fade-in muito suave
-            fade_samples = int(0.1 * sr)  # 100ms
-            if fade_samples < len(start_segment):
-                fade_curve = np.linspace(0.3, 1.0, fade_samples)  # começar em 30% do volume
-                start_segment[:fade_samples] *= fade_curve
+            if crossfade_samples > 0:
+                # Região de crossfade
+                fade_start = initial_samples - crossfade_samples
+                fade_end = initial_samples
+                
+                # Fade out do início limpo
+                fade_out = np.linspace(1, 0, crossfade_samples)
+                cleaned_audio[fade_start:fade_end] *= fade_out
+                
+                # Fade in do áudio original
+                fade_in = np.linspace(0, 1, crossfade_samples)
+                original_section = audio_data[fade_start:fade_end] * fade_in
+                
+                # Misturar as duas seções
+                cleaned_audio[fade_start:fade_end] += original_section
+        
+        sf.write(output_path, cleaned_audio, sr)
+        logger.info("🔧 Artefatos do início removidos com sucesso")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Erro ao corrigir artefatos: {e}")
+        return False
+
+def trim_warmup_from_audio(audio_path: str, output_path: str, warmup_word_count: int, sample_rate: int = 22050) -> bool:
+    """Remover o aquecimento do início do áudio com maior precisão"""
+    try:
+        audio_data, sr = sf.read(audio_path)
+        
+        # Estimativa melhorada da duração do aquecimento
+        # Considerando velocidade de fala natural em português
+        avg_chars_per_word = 5  # Média de caracteres por palavra em português
+        estimated_chars = warmup_word_count * avg_chars_per_word
+        
+        # Velocidade de fala: ~150 palavras por minuto = 2.5 palavras/seg
+        speech_rate = 2.5  # palavras por segundo
+        estimated_duration = warmup_word_count / speech_rate
+        
+        # Adicionar margem de segurança
+        safety_margin = 0.2  # 200ms de margem
+        total_duration = estimated_duration + safety_margin
+        
+        warmup_samples = int(total_duration * sr)
+        
+        logger.info(f"🎬 Removendo aquecimento: {warmup_word_count} palavras (~{total_duration:.2f}s)")
+        
+        if warmup_samples < len(audio_data):
+            # Encontrar ponto de corte mais preciso baseado em energia
+            # Analisar energia do áudio para encontrar melhor ponto de corte
+            window_size = int(0.05 * sr)  # Janela de 50ms
+            energy_profile = []
             
-            # Combinar início melhorado com resto do áudio
-            improved_audio = audio_data.copy()
-            improved_audio[:start_samples] = start_segment
+            start_analysis = max(0, warmup_samples - int(0.5 * sr))  # 500ms antes da estimativa
+            end_analysis = min(len(audio_data), warmup_samples + int(0.5 * sr))  # 500ms depois
             
-            sf.write(output_path, improved_audio, sr)
-            logger.info("🎛️ Início do áudio melhorado")
+            for i in range(start_analysis, end_analysis, window_size):
+                window = audio_data[i:i + window_size]
+                energy = np.sum(window ** 2)
+                energy_profile.append((i, energy))
+            
+            if energy_profile:
+                # Encontrar o ponto com menor energia (mais provável ser entre palavras)
+                min_energy_idx = min(energy_profile, key=lambda x: x[1])[0]
+                
+                # Se encontrou um ponto melhor, usar ele
+                if abs(min_energy_idx - warmup_samples) < int(0.3 * sr):  # Dentro de 300ms
+                    warmup_samples = min_energy_idx
+                    logger.info(f"🎯 Ponto de corte ajustado baseado em energia: {min_energy_idx/sr:.2f}s")
+            
+            # Cortar o aquecimento
+            trimmed_audio = audio_data[warmup_samples:]
+            
+            # Aplicar fade-in suave para evitar click
+            fade_samples = int(0.05 * sr)  # 50ms fade-in
+            if len(trimmed_audio) > fade_samples:
+                fade_curve = np.linspace(0, 1, fade_samples) ** 1.5  # Curva suave
+                trimmed_audio[:fade_samples] *= fade_curve
+            
+            sf.write(output_path, trimmed_audio, sr)
+            logger.info(f"🎬 Aquecimento removido: {warmup_samples/sr:.2f}s cortados")
             return True
         else:
-            sf.write(output_path, audio_data, sr)
-            return False
+            # Se estimativa foi muito grande, fazer corte conservador
+            conservative_cut = int(0.5 * sr)  # 500ms
+            if conservative_cut < len(audio_data):
+                trimmed_audio = audio_data[conservative_cut:]
+                
+                # Fade-in suave
+                fade_samples = int(0.1 * sr)  # 100ms
+                if len(trimmed_audio) > fade_samples:
+                    fade_curve = np.linspace(0, 1, fade_samples) ** 1.5
+                    trimmed_audio[:fade_samples] *= fade_curve
+                
+                sf.write(output_path, trimmed_audio, sr)
+                logger.warning(f"⚠️ Corte conservador aplicado: {conservative_cut/sr:.2f}s")
+                return True
+            else:
+                # Manter original se não conseguir cortar
+                sf.write(output_path, audio_data, sr)
+                logger.warning("⚠️ Não foi possível remover aquecimento - mantendo áudio original")
+                return False
             
     except Exception as e:
-        logger.error(f"❌ Erro ao melhorar início do áudio: {e}")
+        logger.error(f"❌ Erro ao remover aquecimento: {e}")
         return False
 
 @asynccontextmanager
@@ -629,6 +799,7 @@ async def generate_audio(
     improve_start: bool = Form(True, description="Melhorar qualidade do início do áudio"),
     use_warmup: bool = Form(True, description="Usar aquecimento para melhorar início"),
     fix_hoarseness: bool = Form(True, description="Corrigir rouquidão no áudio"),
+    fix_start_artifacts: bool = Form(True, description="Corrigir barulhos/clicks no primeiro segundo"),
     max_chars_per_chunk: int = Form(0, description="Máximo de caracteres por chunk (0=automático)")
 ):
     if not tts_model:
@@ -813,12 +984,25 @@ async def generate_audio(
         # Pós-processamento final
         processing_steps = []
         
-        # Melhorar início do áudio (apenas se não foi processado por chunks)
-        if improve_start and len(text_chunks) == 1:
+        # Corrigir artefatos no início (clicks, pops, barulhos) - PRIORIDADE MÁXIMA
+        if fix_start_artifacts:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as artifacts_file:
+                artifacts_path = artifacts_file.name
+            
+            if detect_and_fix_audio_artifacts(current_path, artifacts_path):
+                os.unlink(current_path)
+                current_path = artifacts_path
+                processing_steps.append("artefatos início corrigidos")
+            else:
+                os.unlink(artifacts_path)
+        
+        # Melhorar início do áudio (apenas se não foi processado por chunks e não aplicou correção de artefatos)
+        if improve_start and len(text_chunks) == 1 and not fix_start_artifacts:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as improved_file:
                 improved_path = improved_file.name
             
-            if improve_audio_start(current_path, improved_path):
+            # Função simplificada para quando não precisa de correção completa de artefatos
+            if improve_audio_start_simple(current_path, improved_path):
                 os.unlink(current_path)
                 current_path = improved_path
                 processing_steps.append("início melhorado")
@@ -877,7 +1061,8 @@ async def generate_audio(
                 "X-Text-Chunks": str(len(text_chunks)),
                 "X-Processing-Steps": ",".join(processing_steps) if processing_steps else "none",
                 "X-Character-Limit": str(char_limit),
-                "X-Hoarseness-Fixed": "true" if fix_hoarseness else "false"
+                "X-Hoarseness-Fixed": "true" if fix_hoarseness else "false",
+                "X-Start-Artifacts-Fixed": "true" if fix_start_artifacts else "false"
             },
             background=lambda: os.unlink(current_path) if os.path.exists(current_path) else None
         )
@@ -909,7 +1094,7 @@ async def generate_audio_preset(
 ):
     """Gerar áudio com presets otimizados para diferentes estilos"""
     
-    # Definir presets otimizados contra rouquidão
+    # Definir presets otimizados contra rouquidão e artefatos
     presets = {
         "energetic": {
             "temperature": 0.83,
@@ -919,7 +1104,8 @@ async def generate_audio_preset(
             "enable_text_splitting": True,
             "improve_start": True,
             "use_warmup": True,
-            "fix_hoarseness": True
+            "fix_hoarseness": True,
+            "fix_start_artifacts": True
         },
         "balanced": {
             "temperature": 0.82,
@@ -929,7 +1115,8 @@ async def generate_audio_preset(
             "enable_text_splitting": True,
             "improve_start": True,
             "use_warmup": True,
-            "fix_hoarseness": True
+            "fix_hoarseness": True,
+            "fix_start_artifacts": True
         },
         "calm": {
             "temperature": 0.78,
@@ -939,7 +1126,8 @@ async def generate_audio_preset(
             "enable_text_splitting": True,
             "improve_start": True,
             "use_warmup": False,
-            "fix_hoarseness": True
+            "fix_hoarseness": True,
+            "fix_start_artifacts": True
         },
         "expressive": {
             "temperature": 0.85,
@@ -949,7 +1137,8 @@ async def generate_audio_preset(
             "enable_text_splitting": True,
             "improve_start": True,
             "use_warmup": True,
-            "fix_hoarseness": True
+            "fix_hoarseness": True,
+            "fix_start_artifacts": True
         },
         "professional": {
             "temperature": 0.80,
@@ -959,7 +1148,8 @@ async def generate_audio_preset(
             "enable_text_splitting": True,
             "improve_start": True,
             "use_warmup": True,
-            "fix_hoarseness": True
+            "fix_hoarseness": True,
+            "fix_start_artifacts": True
         },
         "clear": {
             "temperature": 0.78,
@@ -969,7 +1159,19 @@ async def generate_audio_preset(
             "enable_text_splitting": True,
             "improve_start": True,
             "use_warmup": True,
-            "fix_hoarseness": True
+            "fix_hoarseness": True,
+            "fix_start_artifacts": True
+        },
+        "clean": {
+            "temperature": 0.76,
+            "repetition_penalty": 8.0,
+            "speed": 0.97,
+            "remove_silence": True,
+            "enable_text_splitting": True,
+            "improve_start": False,  # Não precisa pois fix_start_artifacts já resolve
+            "use_warmup": True,
+            "fix_hoarseness": True,
+            "fix_start_artifacts": True
         }
     }
     
@@ -995,6 +1197,7 @@ async def generate_audio_preset(
         improve_start=config["improve_start"],
         use_warmup=config["use_warmup"],
         fix_hoarseness=config["fix_hoarseness"],
+        fix_start_artifacts=config["fix_start_artifacts"],
         max_chars_per_chunk=0
     )
 
@@ -1026,20 +1229,27 @@ async def get_audio_tips():
             "use_warmup": "true para eliminar problemas no início do áudio"
         },
         "presets": {
-            "energetic": "Voz animada sem rouquidão",
+            "energetic": "Voz animada sem rouquidão nem artefatos",
             "balanced": "Equilíbrio perfeito com clareza máxima", 
             "calm": "Voz suave e cristalina",
             "expressive": "Máxima expressividade mantendo clareza",
             "professional": "Ideal para apresentações corporativas",
-            "clear": "Focado em máxima clareza e eliminação de rouquidão"
+            "clear": "Focado em máxima clareza e eliminação de rouquidão",
+            "clean": "Máxima limpeza - elimina todos os artefatos no início"
         },
-        "anti_hoarseness_tips": [
-            "Use temperature entre 0.78-0.85 (mais baixa = menos rouquidão)",
-            "Mantenha repetition_penalty entre 6.0-7.5",
-            "Textos até 200 caracteres para português evitam degradação",
-            "Sistema divide automaticamente textos longos",
-            "Correção de rouquidão é aplicada automaticamente",
-            "Áudio de referência claro é fundamental"
+        "start_artifacts_tips": [
+            "Use fix_start_artifacts=true para eliminar clicks/pops no primeiro segundo",
+            "Preset 'clean' é especificamente otimizado para início limpo",
+            "Sistema detecta automaticamente clicks, pops e DC offset",
+            "Aplica fade-in suave e filtros específicos",
+            "Remove barulhos digitais comuns no início do áudio"
+        ],
+        "audio_quality_tips": [
+            "Áudio de referência limpo é fundamental",
+            "Evite áudios de referência com clicks ou pops",
+            "Use áudios gravados em ambiente silencioso",
+            "Normalize o volume do áudio de referência",
+            "Prefira formato WAV com 22kHz ou 44kHz"
         ],
         "character_limits": get_character_limits(),
         "text_length_tips": [
