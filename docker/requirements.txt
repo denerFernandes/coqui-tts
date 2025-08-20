@@ -3,7 +3,6 @@ TTS==0.21.3
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 python-multipart==0.0.6
-numpy==1.24.3
 torch>=2.0.0
 torchaudio>=2.0.0
 torchvision>=0.15.0
