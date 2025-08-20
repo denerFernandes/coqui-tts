@@ -70,7 +70,7 @@ async def lifespan(app: FastAPI):
         logger.info("💡 Para usar GPU:")
         logger.info("   - Certifique-se que nvidia-docker está instalado")
         logger.info("   - Use: docker run --gpus all ...")
-        logger.info("   - Ou: nvidia-docker run ..."
+        logger.info("   - Ou: nvidia-docker run ...")
     
     try:
         logger.info("📥 Carregando modelo XTTS-v2...")
