@@ -1,38 +1,40 @@
-FROM nvidia/cuda:13.0.0-cudnn-devel-ubuntu22.04
+FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-devel as builder
 
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONUNBUFFERED=1
+WORKDIR /tmp
 
-RUN apt-get update && apt-get install -y \
-    python3 \
-    python3-pip \
-    python3-venv \
-    python3-dev \
-    git \
-    wget \
-    curl \
-    build-essential \
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+    git \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
-RUN ln -sf /usr/bin/python3 /usr/bin/python
+# Install Python packages
+RUN pip install --no-cache-dir \
+    TTS==0.20.6 \
+    fastapi==0.104.1 \
+    uvicorn==0.24.0 \
+    python-multipart==0.0.6 \
+    soundfile
 
-RUN useradd -m -u 1000 coqui
-USER coqui
-WORKDIR /home/coqui
+# Stage 2: Final lightweight image
+FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
 
-RUN python -m venv coqui_env
-ENV PATH="/home/coqui/coqui_env/bin:$PATH"
+WORKDIR /app
 
-RUN pip install --upgrade pip setuptools wheel
-RUN pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# Copy only necessary files from builder
+COPY --from=builder /opt/conda/lib/python3.10/site-packages /opt/conda/lib/python3.10/site-packages
+COPY --from=builder /opt/conda/bin /opt/conda/bin
 
-COPY --chown=coqui:coqui requirements.txt .
-RUN pip install -r requirements.txt
+# Install only essential system packages
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean \
+    && rm -rf /tmp/* /var/tmp/*
 
-COPY --chown=coqui:coqui server.py .
-
-RUN echo "y" | python -c "from TTS.api import TTS; TTS('tts_models/multilingual/multi-dataset/xtts_v2', gpu=False)" || true
+# Copy application
+COPY server.py .
 
 EXPOSE 8000
 CMD ["python", "server.py"]
