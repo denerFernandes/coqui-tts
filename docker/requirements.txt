@@ -1,6 +1,6 @@
 # docker/requirements.txt
 coqui-tts==0.27.0
-transformers<=4.46.2
+transformers==4.46.2
 fastapi==0.116.1
 uvicorn[standard]==0.35.0
 python-multipart==0.0.20
@@ -8,4 +8,6 @@ torch>=2.0.0
 torchaudio>=2.0.0
 torchvision>=0.15.0
 soundfile==0.13.1
+scipy>=1.7.0
+requests==2.31.0
 

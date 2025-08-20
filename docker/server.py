@@ -129,7 +129,231 @@ def remove_silence_from_audio(audio_path: str, output_path: str) -> bool:
         logger.warning(f"⚠️ Erro ao remover silêncios: {e}")
         return False
 
-def optimize_text_for_speech(text: str, language: str = "pt") -> str:
+def get_character_limits() -> dict:
+    """Limites de caracteres por idioma para XTTS"""
+    return {
+        "pt": 200,  # Português - limite conservador para melhor qualidade
+        "en": 250,  # Inglês
+        "es": 220,  # Espanhol
+        "fr": 230,  # Francês
+        "de": 180,  # Alemão
+        "it": 210,  # Italiano
+        "pl": 190,  # Polonês
+        "tr": 200,  # Turco
+        "ru": 180,  # Russo
+        "nl": 200,  # Holandês
+        "cs": 190,  # Tcheco
+        "ar": 150,  # Árabe
+        "zh": 100,  # Chinês
+        "ja": 120,  # Japonês
+        "hi": 150,  # Hindi
+        "ko": 130   # Coreano
+    }
+
+def smart_text_split(text: str, language: str = "pt", max_chars: int = None) -> list:
+    """Dividir texto inteligentemente respeitando limites por idioma"""
+    limits = get_character_limits()
+    if max_chars is None:
+        max_chars = limits.get(language, 200)
+    
+    # Se texto está dentro do limite, retornar como está
+    if len(text) <= max_chars:
+        return [text]
+    
+    # Dividir por sentenças primeiro
+    import re
+    
+    # Padrões de divisão por idioma
+    sentence_patterns = {
+        "pt": r'[.!?]+\s+',
+        "en": r'[.!?]+\s+',
+        "es": r'[.!?]+\s+',
+        "fr": r'[.!?]+\s+',
+        "de": r'[.!?]+\s+',
+        "it": r'[.!?]+\s+',
+    }
+    
+    pattern = sentence_patterns.get(language, r'[.!?]+\s+')
+    sentences = re.split(pattern, text.strip())
+    
+    # Reagrupar sentenças em chunks menores que o limite
+    chunks = []
+    current_chunk = ""
+    
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+            
+        # Adicionar pontuação se não houver
+        if not sentence.endswith(('.', '!', '?')):
+            sentence += '.'
+        
+        # Se sentença sozinha já excede limite, dividir por vírgulas
+        if len(sentence) > max_chars:
+            sub_parts = sentence.split(',')
+            for part in sub_parts:
+                part = part.strip()
+                if len(part) > max_chars:
+                    # Se ainda muito grande, dividir forçadamente
+                    for i in range(0, len(part), max_chars - 10):
+                        chunk_part = part[i:i + max_chars - 10].strip()
+                        if chunk_part:
+                            chunks.append(chunk_part + '.')
+                else:
+                    if len(current_chunk + part) > max_chars:
+                        if current_chunk:
+                            chunks.append(current_chunk.strip())
+                        current_chunk = part + ', '
+                    else:
+                        current_chunk += part + ', '
+        else:
+            # Verificar se pode adicionar à chunk atual
+            test_chunk = current_chunk + sentence + ' '
+            if len(test_chunk) > max_chars:
+                # Salvar chunk atual e iniciar nova
+                if current_chunk.strip():
+                    chunks.append(current_chunk.strip())
+                current_chunk = sentence + ' '
+            else:
+                current_chunk += sentence + ' '
+    
+    # Adicionar última chunk se houver
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+    
+    # Garantir que nenhuma chunk excede o limite
+    final_chunks = []
+    for chunk in chunks:
+        if len(chunk) > max_chars:
+            # Divisão forçada como último recurso
+            for i in range(0, len(chunk), max_chars - 10):
+                sub_chunk = chunk[i:i + max_chars - 10].strip()
+                if sub_chunk:
+                    final_chunks.append(sub_chunk)
+        else:
+            final_chunks.append(chunk)
+    
+    logger.info(f"📝 Texto dividido em {len(final_chunks)} chunks (limite: {max_chars} chars)")
+    for i, chunk in enumerate(final_chunks):
+        logger.info(f"   Chunk {i+1}: {len(chunk)} chars - '{chunk[:50]}...'")
+    
+    return final_chunks
+
+def fix_audio_hoarseness(audio_path: str, output_path: str) -> bool:
+    """Corrigir rouquidão no áudio"""
+    try:
+        audio_data, sr = sf.read(audio_path)
+        
+        # Normalizar volume para evitar saturação
+        max_val = np.max(np.abs(audio_data))
+        if max_val > 0:
+            # Normalizar para 85% do máximo para evitar clipping
+            audio_data = audio_data * (0.85 / max_val)
+        
+        # Aplicar filtro passa-alta suave para reduzir ruído baixo
+        from scipy import signal
+        
+        # Filtro passa-alta em 80Hz para remover ruído de fundo
+        nyquist = sr / 2
+        low_cutoff = 80 / nyquist
+        
+        if low_cutoff < 0.99:  # Verificar se frequência é válida
+            b, a = signal.butter(2, low_cutoff, btype='high')
+            audio_data = signal.filtfilt(b, a, audio_data)
+        
+        # Suavizar picos que causam rouquidão
+        # Detecção de picos excessivos
+        threshold = np.std(audio_data) * 3
+        peaks = np.abs(audio_data) > threshold
+        
+        if np.any(peaks):
+            # Suavizar apenas os picos detectados
+            window_size = int(0.005 * sr)  # 5ms de janela
+            for i in np.where(peaks)[0]:
+                start = max(0, i - window_size // 2)
+                end = min(len(audio_data), i + window_size // 2)
+                if end > start:
+                    # Aplicar suavização gaussiana na região do pico
+                    audio_data[start:end] = signal.savgol_filter(
+                        audio_data[start:end], 
+                        min(11, end - start) if (end - start) % 2 == 1 else min(10, end - start - 1), 
+                        3
+                    )
+        
+        # Compressão suave para uniformizar dinâmica
+        # Compressor simples: reduzir apenas volumes muito altos
+        compression_threshold = 0.7
+        compression_ratio = 0.6
+        
+        mask = np.abs(audio_data) > compression_threshold
+        audio_data[mask] = np.sign(audio_data[mask]) * (
+            compression_threshold + 
+            (np.abs(audio_data[mask]) - compression_threshold) * compression_ratio
+        )
+        
+        sf.write(output_path, audio_data, sr)
+        logger.info("🎛️ Correção de rouquidão aplicada")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Erro ao corrigir rouquidão: {e}")
+        return False
+
+def concatenate_audio_chunks(chunk_paths: list, output_path: str, crossfade_duration: float = 0.1) -> bool:
+    """Concatenar chunks de áudio com crossfade suave"""
+    try:
+        if not chunk_paths:
+            return False
+        
+        if len(chunk_paths) == 1:
+            # Se apenas um chunk, copiar diretamente
+            audio_data, sr = sf.read(chunk_paths[0])
+            sf.write(output_path, audio_data, sr)
+            return True
+        
+        # Carregar primeiro chunk
+        final_audio, sr = sf.read(chunk_paths[0])
+        
+        crossfade_samples = int(crossfade_duration * sr)
+        
+        for chunk_path in chunk_paths[1:]:
+            next_audio, next_sr = sf.read(chunk_path)
+            
+            if next_sr != sr:
+                logger.warning(f"⚠️ Sample rates diferentes: {sr} vs {next_sr}")
+                continue
+            
+            # Aplicar crossfade entre chunks
+            if len(final_audio) > crossfade_samples and len(next_audio) > crossfade_samples:
+                # Fade out no final do áudio atual
+                fade_out = np.linspace(1, 0, crossfade_samples)
+                final_audio[-crossfade_samples:] *= fade_out
+                
+                # Fade in no início do próximo áudio
+                fade_in = np.linspace(0, 1, crossfade_samples)
+                next_audio[:crossfade_samples] *= fade_in
+                
+                # Sobrepor as regiões de crossfade
+                overlap_region = final_audio[-crossfade_samples:] + next_audio[:crossfade_samples]
+                
+                # Concatenar: áudio atual (sem final) + overlap + próximo áudio (sem início)
+                final_audio = np.concatenate([
+                    final_audio[:-crossfade_samples],
+                    overlap_region,
+                    next_audio[crossfade_samples:]
+                ])
+            else:
+                # Se chunks muito pequenos, concatenar diretamente
+                final_audio = np.concatenate([final_audio, next_audio])
+        
+        sf.write(output_path, final_audio, sr)
+        logger.info(f"🔗 {len(chunk_paths)} chunks concatenados com crossfade")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Erro ao concatenar chunks: {e}")
+        return False
     """Otimizar texto para melhor síntese de voz"""
     # Adicionar pontuação para pausas naturais
     text = text.strip()
@@ -394,16 +618,18 @@ async def generate_audio(
     text: str = Form(..., description="Texto para sintetizar"),
     reference_audio: UploadFile = File(..., description="Áudio de referência (.wav)"),
     language: str = Form("pt", description="Código do idioma"),
-    temperature: float = Form(0.85, description="Temperatura (0.7-0.95) - maior = mais expressiva"),
+    temperature: float = Form(0.82, description="Temperatura (0.75-0.90) - mais baixa para menos rouquidão"),
     length_penalty: float = Form(1.0, description="Penalidade de comprimento"),
-    repetition_penalty: float = Form(5.0, description="Penalidade de repetição (2.0-10.0)"),
+    repetition_penalty: float = Form(6.0, description="Penalidade de repetição (4.0-8.0)"),
     top_k: int = Form(50, description="Top-k sampling"),
     top_p: float = Form(0.85, description="Top-p sampling"),
     speed: float = Form(1.0, description="Velocidade da fala (0.8-1.2)"),
-    enable_text_splitting: bool = Form(True, description="Dividir texto em sentenças"),
+    enable_text_splitting: bool = Form(True, description="Dividir texto automaticamente"),
     remove_silence: bool = Form(True, description="Remover silêncios excessivos"),
     improve_start: bool = Form(True, description="Melhorar qualidade do início do áudio"),
-    use_warmup: bool = Form(True, description="Usar aquecimento para melhorar início")
+    use_warmup: bool = Form(True, description="Usar aquecimento para melhorar início"),
+    fix_hoarseness: bool = Form(True, description="Corrigir rouquidão no áudio"),
+    max_chars_per_chunk: int = Form(0, description="Máximo de caracteres por chunk (0=automático)")
 ):
     if not tts_model:
         raise HTTPException(status_code=503, detail="Modelo não carregado")
@@ -425,12 +651,12 @@ async def generate_audio(
     if len(text) > 1000:
         raise HTTPException(status_code=400, detail="Texto muito longo (máximo 1000 caracteres)")
     
-    # Validar parâmetros melhorados
-    if not (0.7 <= temperature <= 0.95):
-        raise HTTPException(status_code=400, detail="Temperatura deve estar entre 0.7 e 0.95 para melhor qualidade")
+    # Validar parâmetros melhorados para evitar rouquidão
+    if not (0.75 <= temperature <= 0.90):
+        raise HTTPException(status_code=400, detail="Temperatura deve estar entre 0.75 e 0.90 para evitar rouquidão")
     
-    if not (2.0 <= repetition_penalty <= 10.0):
-        raise HTTPException(status_code=400, detail="Repetition penalty deve estar entre 2.0 e 10.0")
+    if not (4.0 <= repetition_penalty <= 8.0):
+        raise HTTPException(status_code=400, detail="Repetition penalty deve estar entre 4.0 e 8.0")
     
     if not (0.8 <= speed <= 1.2):
         raise HTTPException(status_code=400, detail="Velocidade deve estar entre 0.8 e 1.2")
@@ -443,19 +669,25 @@ async def generate_audio(
         logger.info(f"🎵 Gerando áudio - Texto: {len(text)} chars, Idioma: {language}, Temp: {temperature}")
         start_time = time.time()
         
+        # Verificar limite de caracteres
+        char_limits = get_character_limits()
+        char_limit = char_limits.get(language, 200)
+        if max_chars_per_chunk > 0:
+            char_limit = min(char_limit, max_chars_per_chunk)
+        
+        if len(text) > char_limit:
+            logger.info(f"⚠️ Texto excede limite de {char_limit} chars para '{language}' - será dividido em chunks")
+        
         # Otimizar texto para melhor síntese
         optimized_text = optimize_text_for_speech(text, language)
         if optimized_text != text:
             logger.info(f"📝 Texto otimizado para síntese")
         
-        # Adicionar aquecimento se habilitado
-        warmup_word_count = 0
-        if use_warmup:
-            warmed_text, warmup_word_count = add_warmup_context(optimized_text, language)
-            logger.info(f"🔥 Aquecimento adicionado - {warmup_word_count} palavras")
-            final_text = warmed_text
+        # Dividir texto em chunks se necessário
+        if enable_text_splitting and len(optimized_text) > char_limit:
+            text_chunks = smart_text_split(optimized_text, language, char_limit)
         else:
-            final_text = optimized_text
+            text_chunks = [optimized_text]
         
         # Salvar áudio de referência temporariamente
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as ref_file:
@@ -475,60 +707,114 @@ async def generate_audio(
             for rec in validation["recommendations"]:
                 logger.info(f"💡 {rec}")
         
-        # Gerar áudio
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as out_file:
-            out_path = out_file.name
+        # Processar cada chunk
+        chunk_paths = []
         
-        # Síntese de voz com parâmetros otimizados
-        try:
-            logger.info(f"🎤 Iniciando síntese com parâmetros otimizados...")
+        for i, chunk_text in enumerate(text_chunks):
+            logger.info(f"🎤 Processando chunk {i+1}/{len(text_chunks)} ({len(chunk_text)} chars)")
             
-            tts_model.tts_to_file(
-                text=final_text,  # Usar texto com aquecimento se habilitado
-                speaker_wav=ref_path,
-                language=language,
-                file_path=out_path,
-                temperature=temperature,
-                length_penalty=length_penalty,
-                repetition_penalty=repetition_penalty,
-                top_k=top_k,
-                top_p=top_p,
-                speed=speed,
-                split_sentences=enable_text_splitting
-            )
+            # Adicionar aquecimento se habilitado e for o primeiro chunk
+            warmup_word_count = 0
+            if use_warmup and i == 0:  # Aquecimento apenas no primeiro chunk
+                warmed_text, warmup_word_count = add_warmup_context(chunk_text, language)
+                logger.info(f"🔥 Aquecimento adicionado ao primeiro chunk - {warmup_word_count} palavras")
+                final_chunk_text = warmed_text
+            else:
+                final_chunk_text = chunk_text
             
-        except AttributeError as e:
-            if "'GPT2InferenceModel' object has no attribute 'generate'" in str(e):
-                logger.error("❌ Erro de compatibilidade detectado! Verifique as versões do coqui-tts e transformers")
-                raise HTTPException(
-                    status_code=500, 
-                    detail="Erro de compatibilidade: Atualize para coqui-tts>=0.27.0 e transformers<=4.46.2"
+            # Gerar áudio para este chunk
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as chunk_file:
+                chunk_path = chunk_file.name
+            
+            # Síntese de voz com parâmetros otimizados para evitar rouquidão
+            try:
+                logger.info(f"🎤 Sintetizando chunk {i+1} com parâmetros anti-rouquidão...")
+                
+                tts_model.tts_to_file(
+                    text=final_chunk_text,
+                    speaker_wav=ref_path,
+                    language=language,
+                    file_path=chunk_path,
+                    temperature=temperature,  # Temperatura mais baixa para menos rouquidão
+                    length_penalty=length_penalty,
+                    repetition_penalty=repetition_penalty,
+                    top_k=top_k,
+                    top_p=top_p,
+                    speed=speed,
+                    split_sentences=False  # Já dividimos manualmente
                 )
-            raise
+                
+            except AttributeError as e:
+                if "'GPT2InferenceModel' object has no attribute 'generate'" in str(e):
+                    logger.error("❌ Erro de compatibilidade detectado!")
+                    raise HTTPException(
+                        status_code=500, 
+                        detail="Erro de compatibilidade: Atualize para coqui-tts>=0.27.0 e transformers<=4.46.2"
+                    )
+                raise
+            
+            # Pós-processamento do chunk
+            current_chunk_path = chunk_path
+            
+            # Remover aquecimento se foi usado (apenas no primeiro chunk)
+            if use_warmup and i == 0 and warmup_word_count > 0:
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as trimmed_file:
+                    trimmed_path = trimmed_file.name
+                
+                try:
+                    audio_data, sr = sf.read(current_chunk_path)
+                    if trim_warmup_from_audio(current_chunk_path, trimmed_path, warmup_word_count, sr):
+                        os.unlink(current_chunk_path)
+                        current_chunk_path = trimmed_path
+                        logger.info(f"🎬 Aquecimento removido do chunk {i+1}")
+                    else:
+                        os.unlink(trimmed_path)
+                except Exception as e:
+                    logger.warning(f"⚠️ Falha ao remover aquecimento do chunk {i+1}: {e}")
+                    os.unlink(trimmed_path)
+            
+            # Verificar se arquivo foi gerado corretamente
+            if not os.path.exists(current_chunk_path) or os.path.getsize(current_chunk_path) == 0:
+                logger.error(f"❌ Falha na geração do chunk {i+1}")
+                continue
+            
+            chunk_paths.append(current_chunk_path)
+            logger.info(f"✅ Chunk {i+1} gerado com sucesso")
         
-        # Pós-processamento em etapas
-        current_path = out_path
+        if not chunk_paths:
+            raise HTTPException(status_code=500, detail="Falha na geração de todos os chunks")
+        
+        # Concatenar chunks se houver múltiplos
+        if len(chunk_paths) > 1:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as concat_file:
+                concatenated_path = concat_file.name
+            
+            if concatenate_audio_chunks(chunk_paths, concatenated_path):
+                # Limpar chunks individuais
+                for chunk_path in chunk_paths:
+                    try:
+                        os.unlink(chunk_path)
+                    except:
+                        pass
+                current_path = concatenated_path
+                logger.info(f"🔗 {len(chunk_paths)} chunks concatenados")
+            else:
+                # Se concatenação falhou, usar primeiro chunk
+                current_path = chunk_paths[0]
+                # Limpar outros chunks
+                for chunk_path in chunk_paths[1:]:
+                    try:
+                        os.unlink(chunk_path)
+                    except:
+                        pass
+        else:
+            current_path = chunk_paths[0]
+        
+        # Pós-processamento final
         processing_steps = []
         
-        # Etapa 1: Remover aquecimento se foi usado
-        if use_warmup and warmup_word_count > 0:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as trimmed_file:
-                trimmed_path = trimmed_file.name
-            
-            try:
-                audio_data, sr = sf.read(current_path)
-                if trim_warmup_from_audio(current_path, trimmed_path, warmup_word_count, sr):
-                    os.unlink(current_path)
-                    current_path = trimmed_path
-                    processing_steps.append("aquecimento removido")
-                else:
-                    os.unlink(trimmed_path)
-            except Exception as e:
-                logger.warning(f"⚠️ Falha ao remover aquecimento: {e}")
-                os.unlink(trimmed_path)
-        
-        # Etapa 2: Melhorar início do áudio
-        if improve_start:
+        # Melhorar início do áudio (apenas se não foi processado por chunks)
+        if improve_start and len(text_chunks) == 1:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as improved_file:
                 improved_path = improved_file.name
             
@@ -539,7 +825,19 @@ async def generate_audio(
             else:
                 os.unlink(improved_path)
         
-        # Etapa 3: Remover silêncios se solicitado
+        # Corrigir rouquidão
+        if fix_hoarseness:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fixed_file:
+                fixed_path = fixed_file.name
+            
+            if fix_audio_hoarseness(current_path, fixed_path):
+                os.unlink(current_path)
+                current_path = fixed_path
+                processing_steps.append("rouquidão corrigida")
+            else:
+                os.unlink(fixed_path)
+        
+        # Remover silêncios se solicitado
         if remove_silence:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as processed_file:
                 processed_path = processed_file.name
@@ -551,9 +849,9 @@ async def generate_audio(
             else:
                 os.unlink(processed_path)
         
-        # Verificar se o arquivo foi gerado
+        # Verificar arquivo final
         if not os.path.exists(current_path) or os.path.getsize(current_path) == 0:
-            raise HTTPException(status_code=500, detail="Falha na geração do áudio")
+            raise HTTPException(status_code=500, detail="Falha na geração do áudio final")
         
         generation_time = time.time() - start_time
         file_size = os.path.getsize(current_path)
@@ -562,11 +860,11 @@ async def generate_audio(
         try:
             final_audio, final_sr = sf.read(current_path)
             final_duration = len(final_audio) / final_sr
-            logger.info(f"✅ Áudio gerado em {generation_time:.2f}s - Tamanho: {file_size} bytes - Duração: {final_duration:.1f}s")
+            logger.info(f"✅ Áudio gerado em {generation_time:.2f}s - {len(text_chunks)} chunks - Duração: {final_duration:.1f}s")
             if processing_steps:
-                logger.info(f"🎛️ Pós-processamento aplicado: {', '.join(processing_steps)}")
+                logger.info(f"🎛️ Pós-processamento: {', '.join(processing_steps)}")
         except:
-            logger.info(f"✅ Áudio gerado em {generation_time:.2f}s - Tamanho: {file_size} bytes")
+            logger.info(f"✅ Áudio gerado em {generation_time:.2f}s - {len(text_chunks)} chunks - Tamanho: {file_size} bytes")
         
         return FileResponse(
             current_path,
@@ -576,9 +874,10 @@ async def generate_audio(
                 "X-Generation-Time": str(generation_time),
                 "X-File-Size": str(file_size),
                 "X-Audio-Duration": str(final_duration) if 'final_duration' in locals() else "unknown",
+                "X-Text-Chunks": str(len(text_chunks)),
                 "X-Processing-Steps": ",".join(processing_steps) if processing_steps else "none",
-                "X-Warmup-Used": "true" if use_warmup else "false",
-                "X-Start-Improved": "true" if improve_start else "false"
+                "X-Character-Limit": str(char_limit),
+                "X-Hoarseness-Fixed": "true" if fix_hoarseness else "false"
             },
             background=lambda: os.unlink(current_path) if os.path.exists(current_path) else None
         )
@@ -610,52 +909,67 @@ async def generate_audio_preset(
 ):
     """Gerar áudio com presets otimizados para diferentes estilos"""
     
-    # Definir presets
+    # Definir presets otimizados contra rouquidão
     presets = {
         "energetic": {
-            "temperature": 0.90,
-            "repetition_penalty": 7.0,
-            "speed": 1.1,
-            "remove_silence": True,
-            "enable_text_splitting": True,
-            "improve_start": True,
-            "use_warmup": True
-        },
-        "balanced": {
-            "temperature": 0.85,
-            "repetition_penalty": 5.0,
-            "speed": 1.0,
-            "remove_silence": True,
-            "enable_text_splitting": True,
-            "improve_start": True,
-            "use_warmup": True
-        },
-        "calm": {
-            "temperature": 0.80,
-            "repetition_penalty": 3.0,
-            "speed": 0.95,
-            "remove_silence": False,
-            "enable_text_splitting": True,
-            "improve_start": True,
-            "use_warmup": False
-        },
-        "expressive": {
-            "temperature": 0.95,
-            "repetition_penalty": 8.0,
+            "temperature": 0.83,
+            "repetition_penalty": 6.5,
             "speed": 1.05,
             "remove_silence": True,
-            "enable_text_splitting": False,
+            "enable_text_splitting": True,
             "improve_start": True,
-            "use_warmup": True
+            "use_warmup": True,
+            "fix_hoarseness": True
         },
-        "professional": {
-            "temperature": 0.87,
+        "balanced": {
+            "temperature": 0.82,
             "repetition_penalty": 6.0,
             "speed": 1.0,
             "remove_silence": True,
             "enable_text_splitting": True,
             "improve_start": True,
-            "use_warmup": True
+            "use_warmup": True,
+            "fix_hoarseness": True
+        },
+        "calm": {
+            "temperature": 0.78,
+            "repetition_penalty": 5.5,
+            "speed": 0.95,
+            "remove_silence": False,
+            "enable_text_splitting": True,
+            "improve_start": True,
+            "use_warmup": False,
+            "fix_hoarseness": True
+        },
+        "expressive": {
+            "temperature": 0.85,
+            "repetition_penalty": 7.0,
+            "speed": 1.02,
+            "remove_silence": True,
+            "enable_text_splitting": True,
+            "improve_start": True,
+            "use_warmup": True,
+            "fix_hoarseness": True
+        },
+        "professional": {
+            "temperature": 0.80,
+            "repetition_penalty": 6.5,
+            "speed": 1.0,
+            "remove_silence": True,
+            "enable_text_splitting": True,
+            "improve_start": True,
+            "use_warmup": True,
+            "fix_hoarseness": True
+        },
+        "clear": {
+            "temperature": 0.78,
+            "repetition_penalty": 7.5,
+            "speed": 0.98,
+            "remove_silence": True,
+            "enable_text_splitting": True,
+            "improve_start": True,
+            "use_warmup": True,
+            "fix_hoarseness": True
         }
     }
     
@@ -679,7 +993,9 @@ async def generate_audio_preset(
         enable_text_splitting=config["enable_text_splitting"],
         remove_silence=config["remove_silence"],
         improve_start=config["improve_start"],
-        use_warmup=config["use_warmup"]
+        use_warmup=config["use_warmup"],
+        fix_hoarseness=config["fix_hoarseness"],
+        max_chars_per_chunk=0
     )
 
 @app.get("/audio-tips")
@@ -710,18 +1026,28 @@ async def get_audio_tips():
             "use_warmup": "true para eliminar problemas no início do áudio"
         },
         "presets": {
-            "energetic": "Voz animada e dinâmica com início otimizado",
-            "balanced": "Equilíbrio entre naturalidade e expressividade",
-            "calm": "Voz mais suave e relaxada",
-            "expressive": "Máxima expressividade e emoção",
-            "professional": "Ideal para narrações e apresentações corporativas"
+            "energetic": "Voz animada sem rouquidão",
+            "balanced": "Equilíbrio perfeito com clareza máxima", 
+            "calm": "Voz suave e cristalina",
+            "expressive": "Máxima expressividade mantendo clareza",
+            "professional": "Ideal para apresentações corporativas",
+            "clear": "Focado em máxima clareza e eliminação de rouquidão"
         },
-        "start_quality_tips": [
-            "Use 'use_warmup=true' para melhorar drasticamente o início",
-            "Combine com 'improve_start=true' para máxima qualidade",
-            "O aquecimento adiciona contexto que melhora a síntese",
-            "O processamento remove automaticamente o aquecimento",
-            "Resultado: início limpo e de alta qualidade"
+        "anti_hoarseness_tips": [
+            "Use temperature entre 0.78-0.85 (mais baixa = menos rouquidão)",
+            "Mantenha repetition_penalty entre 6.0-7.5",
+            "Textos até 200 caracteres para português evitam degradação",
+            "Sistema divide automaticamente textos longos",
+            "Correção de rouquidão é aplicada automaticamente",
+            "Áudio de referência claro é fundamental"
+        ],
+        "character_limits": get_character_limits(),
+        "text_length_tips": [
+            "Português: máximo 200 caracteres por chunk",
+            "Inglês: máximo 250 caracteres por chunk", 
+            "Sistema divide automaticamente textos longos",
+            "Chunks são concatenados com crossfade suave",
+            "Divisão inteligente respeita pontuação"
         ]
     }
 async def generate_batch(
