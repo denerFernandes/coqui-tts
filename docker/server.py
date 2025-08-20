@@ -6,7 +6,7 @@ import torch
 import logging
 import time
 import gc
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from TTS.api import TTS
@@ -160,7 +160,6 @@ async def health_check():
 
 @app.post("/generate")
 async def generate_audio(
-    background_tasks: BackgroundTasks,
     text: str = Form(..., description="Texto para sintetizar"),
     reference_audio: UploadFile = File(..., description="Áudio de referência (.wav)"),
     language: str = Form("pt", description="Código do idioma"),
@@ -244,12 +243,9 @@ async def generate_audio(
         file_size = os.path.getsize(out_path)
         logger.info(f"✅ Áudio gerado em {generation_time:.2f}s - Tamanho: {file_size} bytes")
         
-        # Agendar limpeza do arquivo após envio
-        background_tasks.add_task(cleanup_file, out_path)
-        
         return FileResponse(
             out_path,
-            media_type="audio/wav",
+            media_type="audio/wav", 
             filename=f"generated_{int(time.time())}.wav",
             headers={
                 "X-Generation-Time": str(generation_time),
