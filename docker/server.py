@@ -5,14 +5,19 @@ import tempfile
 import torch
 import logging
 import time
+import gc
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from TTS.api import TTS
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 # Configurar logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Variável global para o modelo
@@ -35,25 +40,39 @@ async def lifespan(app: FastAPI):
         logger.info("📥 Carregando modelo XTTS-v2...")
         start_time = time.time()
         
-        tts_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=torch.cuda.is_available())
+        # Carregar modelo com tratamento de erro melhorado
+        tts_model = TTS(
+            "tts_models/multilingual/multi-dataset/xtts_v2", 
+            gpu=torch.cuda.is_available()
+        )
         
         load_time = time.time() - start_time
         logger.info(f"✅ Modelo carregado em {load_time:.2f}s!")
         
+        # Verificar se o modelo tem os métodos necessários
+        if not hasattr(tts_model, 'tts_to_file'):
+            raise AttributeError("Modelo não possui método tts_to_file")
+            
     except Exception as e:
         logger.error(f"❌ Erro ao carregar modelo: {e}")
+        logger.error(f"Tipo de erro: {type(e).__name__}")
         raise
     
     yield
     
     # Shutdown
     logger.info("🔥 Desligando servidor...")
+    if tts_model:
+        del tts_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
 
 # Criar app FastAPI
 app = FastAPI(
     title="Coqui TTS Server",
     description="Servidor de síntese de voz com XTTS-v2",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -68,7 +87,12 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return {"message": "Coqui TTS Server", "status": "running"}
+    return {
+        "message": "Coqui TTS Server", 
+        "status": "running",
+        "version": "2.0.0",
+        "model": "XTTS-v2"
+    }
 
 @app.get("/health")
 async def health_check():
@@ -77,14 +101,16 @@ async def health_check():
         gpu_info = {
             "gpu_name": torch.cuda.get_device_name(0),
             "gpu_memory_used": f"{torch.cuda.memory_allocated(0) / 1024**3:.2f}GB",
-            "gpu_memory_total": f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB"
+            "gpu_memory_total": f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB",
+            "gpu_memory_free": f"{(torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)) / 1024**3:.2f}GB"
         }
     
     return {
         "status": "healthy",
         "model_loaded": tts_model is not None,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
-        "gpu_info": gpu_info
+        "gpu_info": gpu_info,
+        "temp_dir": str(tempfile.gettempdir())
     }
 
 @app.post("/generate")
@@ -101,8 +127,16 @@ async def generate_audio(
     if not tts_model:
         raise HTTPException(status_code=503, detail="Modelo não carregado")
     
-    if not reference_audio.filename.endswith(('.wav', '.mp3', '.flac')):
-        raise HTTPException(status_code=400, detail="Formato de áudio não suportado")
+    # Validações melhoradas
+    if not reference_audio.filename:
+        raise HTTPException(status_code=400, detail="Nome do arquivo de áudio não fornecido")
+    
+    allowed_extensions = ('.wav', '.mp3', '.flac', '.ogg')
+    if not reference_audio.filename.lower().endswith(allowed_extensions):
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Formato de áudio não suportado. Use: {', '.join(allowed_extensions)}"
+        )
     
     if len(text.strip()) == 0:
         raise HTTPException(status_code=400, detail="Texto não pode estar vazio")
@@ -110,9 +144,16 @@ async def generate_audio(
     if len(text) > 1000:
         raise HTTPException(status_code=400, detail="Texto muito longo (máximo 1000 caracteres)")
     
+    # Validar parâmetros
+    if not (0.1 <= temperature <= 1.0):
+        raise HTTPException(status_code=400, detail="Temperatura deve estar entre 0.1 e 1.0")
+    
+    ref_path = None
+    out_path = None
+    
     try:
         # Log da requisição
-        logger.info(f"🎵 Gerando áudio - Texto: {len(text)} chars, Temp: {temperature}")
+        logger.info(f"🎵 Gerando áudio - Texto: {len(text)} chars, Idioma: {language}, Temp: {temperature}")
         start_time = time.time()
         
         # Salvar áudio de referência temporariamente
@@ -121,39 +162,68 @@ async def generate_audio(
             ref_file.write(content)
             ref_path = ref_file.name
         
+        logger.info(f"📁 Áudio de referência salvo: {ref_path}")
+        
         # Gerar áudio
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as out_file:
             out_path = out_file.name
         
-        # Síntese de voz
-        tts_model.tts_to_file(
-            text=text,
-            speaker_wav=ref_path,
-            language=language,
-            file_path=out_path,
-            temperature=temperature,
-            length_penalty=length_penalty,
-            repetition_penalty=repetition_penalty,
-            top_k=top_k,
-            top_p=top_p
-        )
+        # Síntese de voz com tratamento de erro específico
+        try:
+            tts_model.tts_to_file(
+                text=text,
+                speaker_wav=ref_path,
+                language=language,
+                file_path=out_path,
+                temperature=temperature,
+                length_penalty=length_penalty,
+                repetition_penalty=repetition_penalty,
+                top_k=top_k,
+                top_p=top_p
+            )
+        except AttributeError as e:
+            if "'GPT2InferenceModel' object has no attribute 'generate'" in str(e):
+                logger.error("❌ Erro de compatibilidade detectado! Verifique as versões do coqui-tts e transformers")
+                raise HTTPException(
+                    status_code=500, 
+                    detail="Erro de compatibilidade: Atualize para coqui-tts>=0.27.0 e transformers<=4.46.2"
+                )
+            raise
         
-        # Limpar arquivo de referência
-        os.unlink(ref_path)
+        # Verificar se o arquivo foi gerado
+        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            raise HTTPException(status_code=500, detail="Falha na geração do áudio")
         
         generation_time = time.time() - start_time
-        logger.info(f"✅ Áudio gerado em {generation_time:.2f}s")
+        file_size = os.path.getsize(out_path)
+        logger.info(f"✅ Áudio gerado em {generation_time:.2f}s - Tamanho: {file_size} bytes")
         
         return FileResponse(
             out_path,
             media_type="audio/wav",
             filename=f"generated_{int(time.time())}.wav",
-            headers={"X-Generation-Time": str(generation_time)}
+            headers={
+                "X-Generation-Time": str(generation_time),
+                "X-File-Size": str(file_size)
+            }
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"❌ Erro ao gerar áudio: {str(e)}")
+        logger.error(f"Tipo de erro: {type(e).__name__}")
         raise HTTPException(status_code=500, detail=f"Erro na síntese: {str(e)}")
+    
+    finally:
+        # Limpar arquivos temporários
+        for path in [ref_path, out_path]:
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                    logger.debug(f"🗑️ Arquivo temporário removido: {path}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Falha ao remover arquivo temporário {path}: {e}")
 
 @app.post("/batch")
 async def generate_batch(
@@ -169,18 +239,32 @@ async def generate_batch(
     if len(texts) > 50:
         raise HTTPException(status_code=400, detail="Máximo 50 textos por lote")
     
+    if not texts:
+        raise HTTPException(status_code=400, detail="Lista de textos não pode estar vazia")
+    
     results = []
+    ref_path = None
     logger.info(f"🔄 Processando lote de {len(texts)} textos...")
     
     # Salvar áudio de referência
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as ref_file:
-        content = await reference_audio.read()
-        ref_file.write(content)
-        ref_path = ref_file.name
-    
     try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as ref_file:
+            content = await reference_audio.read()
+            ref_file.write(content)
+            ref_path = ref_file.name
+        
         for i, text in enumerate(texts):
+            out_path = None
             try:
+                if not text.strip():
+                    results.append({
+                        "index": i,
+                        "text": text,
+                        "success": False,
+                        "error": "Texto vazio"
+                    })
+                    continue
+                
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as out_file:
                     out_path = out_file.name
                 
@@ -192,37 +276,61 @@ async def generate_batch(
                     temperature=temperature
                 )
                 
-                # Ler arquivo gerado
-                with open(out_path, 'rb') as f:
-                    audio_data = f.read()
-                
-                os.unlink(out_path)
-                
-                results.append({
-                    "index": i,
-                    "text": text,
-                    "success": True,
-                    "audio_size": len(audio_data)
-                })
-                
-                logger.info(f"✅ Áudio {i+1}/{len(texts)} gerado")
+                # Verificar se arquivo foi gerado
+                if os.path.exists(out_path):
+                    file_size = os.path.getsize(out_path)
+                    results.append({
+                        "index": i,
+                        "text": text[:50] + "..." if len(text) > 50 else text,
+                        "success": True,
+                        "audio_size": file_size
+                    })
+                    logger.info(f"✅ Áudio {i+1}/{len(texts)} gerado - {file_size} bytes")
+                else:
+                    results.append({
+                        "index": i,
+                        "text": text,
+                        "success": False,
+                        "error": "Arquivo não foi gerado"
+                    })
                 
             except Exception as e:
                 logger.error(f"❌ Erro no áudio {i+1}: {e}")
                 results.append({
                     "index": i,
-                    "text": text,
+                    "text": text[:50] + "..." if len(text) > 50 else text,
                     "success": False,
                     "error": str(e)
                 })
+            
+            finally:
+                if out_path and os.path.exists(out_path):
+                    try:
+                        os.unlink(out_path)
+                    except Exception as e:
+                        logger.warning(f"⚠️ Falha ao remover {out_path}: {e}")
     
     finally:
-        os.unlink(ref_path)
+        if ref_path and os.path.exists(ref_path):
+            try:
+                os.unlink(ref_path)
+            except Exception as e:
+                logger.warning(f"⚠️ Falha ao remover arquivo de referência: {e}")
     
     successful = len([r for r in results if r["success"]])
-    logger.info(f"🎯 Lote concluído: {successful}/{len(texts)} sucessos")
+    total_size = sum(r.get("audio_size", 0) for r in results if r["success"])
     
-    return {"results": results, "summary": {"total": len(texts), "successful": successful}}
+    logger.info(f"🎯 Lote concluído: {successful}/{len(texts)} sucessos - Total: {total_size} bytes")
+    
+    return {
+        "results": results, 
+        "summary": {
+            "total": len(texts), 
+            "successful": successful,
+            "failed": len(texts) - successful,
+            "total_audio_size": total_size
+        }
+    }
 
 if __name__ == "__main__":
     uvicorn.run(
