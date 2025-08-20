@@ -476,7 +476,182 @@ def trim_warmup_from_audio(audio_path: str, output_path: str, warmup_word_count:
         logger.error(f"❌ Erro ao remover aquecimento: {e}")
         return False
 
-def improve_audio_start_simple(audio_path: str, output_path: str) -> bool:
+def aggressive_start_cleaning(audio_path: str, output_path: str) -> bool:
+    """Limpeza agressiva do início do áudio para eliminar completamente a rouquidão"""
+    try:
+        audio_data, sr = sf.read(audio_path)
+        
+        # Parâmetros agressivos para limpeza
+        clean_duration = 2.0  # Limpar primeiros 2 segundos
+        clean_samples = int(clean_duration * sr)
+        clean_samples = min(clean_samples, len(audio_data))
+        
+        if clean_samples < len(audio_data):
+            # Extrair segmento para limpeza
+            start_segment = audio_data[:clean_samples].copy()
+            rest_segment = audio_data[clean_samples:].copy()
+            
+            # 1. Normalização agressiva do início
+            max_val = np.max(np.abs(start_segment))
+            if max_val > 0:
+                start_segment = start_segment * (0.7 / max_val)  # Normalizar para 70%
+            
+            # 2. Suavização agressiva com filtro Savitzky-Golay
+            from scipy import signal
+            window_length = min(51, len(start_segment) // 4 if len(start_segment) > 100 else len(start_segment))
+            if window_length % 2 == 0:
+                window_length -= 1
+            if window_length >= 5:
+                start_segment = signal.savgol_filter(start_segment, window_length, 3)
+            
+            # 3. Remover frequências que causam rouquidão (filtro mais agressivo)
+            nyquist = sr / 2
+            
+            # Filtro passa-alta mais agressivo (100Hz ao invés de 40Hz)
+            high_cutoff = 100 / nyquist
+            if high_cutoff < 0.99:
+                b, a = signal.butter(3, high_cutoff, btype='high')  # Ordem 3 (mais agressivo)
+                start_segment = signal.filtfilt(b, a, start_segment)
+            
+            # Filtro passa-baixa para remover harmonicos que causam aspereza
+            low_cutoff = 8000 / nyquist  # Cortar acima de 8kHz
+            if low_cutoff < 0.99:
+                b, a = signal.butter(2, low_cutoff, btype='low')
+                start_segment = signal.filtfilt(b, a, start_segment)
+            
+            # 4. Compressão dinâmica agressiva
+            threshold = 0.5
+            ratio = 0.3  # Compressão mais forte
+            mask = np.abs(start_segment) > threshold
+            start_segment[mask] = np.sign(start_segment[mask]) * (
+                threshold + (np.abs(start_segment[mask]) - threshold) * ratio
+            )
+            
+            # 5. Fade-in muito suave e longo
+            fade_duration = 0.5  # 500ms de fade-in
+            fade_samples = int(fade_duration * sr)
+            fade_samples = min(fade_samples, len(start_segment))
+            
+            if fade_samples > 0:
+                # Curva de fade exponencial muito suave
+                fade_curve = (np.linspace(0, 1, fade_samples) ** 3) * 0.8  # Começar em 0%, ir até 80%
+                start_segment[:fade_samples] *= fade_curve
+            
+            # 6. Crossfade muito longo entre início limpo e resto
+            crossfade_duration = 0.3  # 300ms de crossfade
+            crossfade_samples = int(crossfade_duration * sr)
+            crossfade_samples = min(crossfade_samples, len(start_segment) // 2, len(rest_segment) // 2)
+            
+            if crossfade_samples > 0:
+                # Região de crossfade no final do início limpo
+                fade_start = len(start_segment) - crossfade_samples
+                
+                # Fade out do início limpo
+                fade_out = np.linspace(1, 0, crossfade_samples)
+                start_segment[fade_start:] *= fade_out
+                
+                # Fade in do resto do áudio
+                fade_in = np.linspace(0, 1, crossfade_samples)
+                rest_fade = rest_segment[:crossfade_samples] * fade_in
+                
+                # Misturar as regiões
+                start_segment[fade_start:] += rest_fade
+                rest_segment = rest_segment[crossfade_samples:]
+            
+            # Reconstruir áudio completo
+            cleaned_audio = np.concatenate([start_segment, rest_segment])
+            
+            sf.write(output_path, cleaned_audio, sr)
+            logger.info(f"🧹 Limpeza agressiva aplicada aos primeiros {clean_duration}s")
+            return True
+        else:
+            # Se áudio muito curto, aplicar apenas suavização
+            from scipy import signal
+            if len(audio_data) > 10:
+                audio_data = signal.savgol_filter(audio_data, 11, 3)
+            
+            # Fade-in suave
+            fade_samples = min(int(0.2 * sr), len(audio_data) // 4)
+            if fade_samples > 0:
+                fade_curve = np.linspace(0, 1, fade_samples) ** 2
+                audio_data[:fade_samples] *= fade_curve
+            
+            sf.write(output_path, audio_data, sr)
+            logger.info("🧹 Limpeza suave aplicada (áudio curto)")
+            return True
+            
+    except Exception as e:
+        logger.error(f"❌ Erro na limpeza agressiva: {e}")
+        return False
+
+def generate_with_ultra_clean_start(text: str, ref_path: str, language: str, output_path: str, **kwargs) -> bool:
+    """Geração com início ultra-limpo usando múltiplas tentativas"""
+    try:
+        # Parâmetros ultra-conservadores para evitar rouquidão
+        ultra_clean_params = {
+            'temperature': 0.72,  # Muito baixa para estabilidade máxima
+            'repetition_penalty': 9.0,  # Muito alta para evitar artefatos
+            'length_penalty': 1.0,
+            'top_k': 30,  # Menor diversidade para mais estabilidade
+            'top_p': 0.75,  # Mais conservador
+            'speed': 0.96,  # Ligeiramente mais lento para melhor qualidade
+            'split_sentences': False  # Não dividir para ter controle total
+        }
+        
+        # Sobrescrever com parâmetros ultra-limpos
+        params = {**kwargs, **ultra_clean_params}
+        
+        logger.info("🎯 Gerando com parâmetros ultra-conservadores...")
+        
+        # Primeira tentativa: com aquecimento longo
+        warmup_phrases = {
+            "pt": "Atenção. Bem-vindos. Olá pessoal.",
+            "en": "Attention. Welcome everyone. Hello folks.",
+            "es": "Atención. Bienvenidos. Hola amigos."
+        }
+        
+        warmup = warmup_phrases.get(language, warmup_phrases["pt"])
+        extended_text = f"{warmup} {text}"
+        
+        # Usar TTS com parâmetros ultra-conservadores
+        tts_model.tts_to_file(
+            text=extended_text,
+            speaker_wav=ref_path,
+            language=language,
+            file_path=output_path,
+            **params
+        )
+        
+        # Detectar onde termina o aquecimento e cortar mais agressivamente
+        audio_data, sr = sf.read(output_path)
+        
+        # Estimar duração do aquecimento (mais conservador)
+        warmup_words = len(warmup.split())
+        estimated_warmup_duration = (warmup_words * 0.8) + 0.5  # Mais tempo por palavra + margem
+        cut_samples = int(estimated_warmup_duration * sr)
+        
+        # Cortar com margem de segurança extra
+        safety_margin = int(0.3 * sr)  # 300ms extra
+        final_cut = cut_samples + safety_margin
+        
+        if final_cut < len(audio_data):
+            # Cortar aquecimento + margem
+            trimmed_audio = audio_data[final_cut:]
+            
+            # Aplicar fade-in imediato
+            fade_samples = int(0.15 * sr)  # 150ms de fade
+            if len(trimmed_audio) > fade_samples:
+                fade_curve = np.linspace(0, 1, fade_samples) ** 2.5  # Curva suave
+                trimmed_audio[:fade_samples] *= fade_curve
+            
+            sf.write(output_path, trimmed_audio, sr)
+            logger.info(f"🎬 Aquecimento removido agressivamente: {final_cut/sr:.2f}s cortados")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Erro na geração ultra-limpa: {e}")
+        return False
     """Melhoria simples do início do áudio (quando não há artefatos graves)"""
     try:
         audio_data, sr = sf.read(audio_path)
@@ -817,18 +992,19 @@ async def generate_audio(
     text: str = Form(..., description="Texto para sintetizar"),
     reference_audio: UploadFile = File(..., description="Áudio de referência (.wav)"),
     language: str = Form("pt", description="Código do idioma"),
-    temperature: float = Form(0.82, description="Temperatura (0.75-0.90) - mais baixa para menos rouquidão"),
+    temperature: float = Form(0.76, description="Temperatura (0.70-0.85) - mais baixa elimina rouquidão"),
     length_penalty: float = Form(1.0, description="Penalidade de comprimento"),
-    repetition_penalty: float = Form(6.0, description="Penalidade de repetição (4.0-8.0)"),
-    top_k: int = Form(50, description="Top-k sampling"),
-    top_p: float = Form(0.85, description="Top-p sampling"),
-    speed: float = Form(1.0, description="Velocidade da fala (0.8-1.2)"),
+    repetition_penalty: float = Form(8.0, description="Penalidade de repetição (6.0-10.0)"),
+    top_k: int = Form(30, description="Top-k sampling (menor = mais estável)"),
+    top_p: float = Form(0.75, description="Top-p sampling (menor = mais estável)"),
+    speed: float = Form(0.96, description="Velocidade da fala (0.9-1.1)"),
     enable_text_splitting: bool = Form(True, description="Dividir texto automaticamente"),
     remove_silence: bool = Form(True, description="Remover silêncios excessivos"),
     improve_start: bool = Form(True, description="Melhorar qualidade do início do áudio"),
     use_warmup: bool = Form(True, description="Usar aquecimento para melhorar início"),
     fix_hoarseness: bool = Form(True, description="Corrigir rouquidão no áudio"),
     fix_start_artifacts: bool = Form(True, description="Corrigir barulhos/clicks no primeiro segundo"),
+    ultra_clean_start: bool = Form(True, description="Limpeza ultra-agressiva do início (anti-rouquidão)"),
     max_chars_per_chunk: int = Form(0, description="Máximo de caracteres por chunk (0=automático)")
 ):
     if not tts_model:
@@ -851,15 +1027,21 @@ async def generate_audio(
     if len(text) > 1000:
         raise HTTPException(status_code=400, detail="Texto muito longo (máximo 1000 caracteres)")
     
-    # Validar parâmetros melhorados para evitar rouquidão
-    if not (0.75 <= temperature <= 0.90):
-        raise HTTPException(status_code=400, detail="Temperatura deve estar entre 0.75 e 0.90 para evitar rouquidão")
+    # Validar parâmetros ultra-conservadores para eliminar rouquidão
+    if not (0.70 <= temperature <= 0.85):
+        raise HTTPException(status_code=400, detail="Temperatura deve estar entre 0.70 e 0.85 para eliminar rouquidão")
     
-    if not (4.0 <= repetition_penalty <= 8.0):
-        raise HTTPException(status_code=400, detail="Repetition penalty deve estar entre 4.0 e 8.0")
+    if not (6.0 <= repetition_penalty <= 10.0):
+        raise HTTPException(status_code=400, detail="Repetition penalty deve estar entre 6.0 e 10.0")
     
-    if not (0.8 <= speed <= 1.2):
-        raise HTTPException(status_code=400, detail="Velocidade deve estar entre 0.8 e 1.2")
+    if not (0.9 <= speed <= 1.1):
+        raise HTTPException(status_code=400, detail="Velocidade deve estar entre 0.9 e 1.1")
+    
+    if not (10 <= top_k <= 50):
+        raise HTTPException(status_code=400, detail="Top-k deve estar entre 10 e 50 para estabilidade")
+    
+    if not (0.65 <= top_p <= 0.85):
+        raise HTTPException(status_code=400, detail="Top-p deve estar entre 0.65 e 0.85")
     
     ref_path = None
     out_path = None
@@ -907,78 +1089,111 @@ async def generate_audio(
             for rec in validation["recommendations"]:
                 logger.info(f"💡 {rec}")
         
-        # Processar cada chunk
+        # Processar cada chunk com método ultra-limpo se solicitado
         chunk_paths = []
         
         for i, chunk_text in enumerate(text_chunks):
             logger.info(f"🎤 Processando chunk {i+1}/{len(text_chunks)} ({len(chunk_text)} chars)")
             
-            # Adicionar aquecimento se habilitado e for o primeiro chunk
-            warmup_word_count = 0
-            if use_warmup and i == 0:  # Aquecimento apenas no primeiro chunk
-                warmed_text, warmup_word_count = add_warmup_context(chunk_text, language)
-                logger.info(f"🔥 Aquecimento adicionado ao primeiro chunk - {warmup_word_count} palavras")
-                final_chunk_text = warmed_text
-            else:
-                final_chunk_text = chunk_text
-            
             # Gerar áudio para este chunk
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as chunk_file:
                 chunk_path = chunk_file.name
             
-            # Síntese de voz com parâmetros otimizados para evitar rouquidão
-            try:
-                logger.info(f"🎤 Sintetizando chunk {i+1} com parâmetros anti-rouquidão...")
+            # Decidir método de geração baseado na configuração
+            if ultra_clean_start and i == 0:  # Primeiro chunk com método ultra-limpo
+                logger.info("🎯 Usando método ultra-limpo para primeiro chunk...")
                 
-                tts_model.tts_to_file(
-                    text=final_chunk_text,
-                    speaker_wav=ref_path,
+                success = generate_with_ultra_clean_start(
+                    text=chunk_text,
+                    ref_path=ref_path,
                     language=language,
-                    file_path=chunk_path,
-                    temperature=temperature,  # Temperatura mais baixa para menos rouquidão
+                    output_path=chunk_path,
+                    temperature=temperature,
                     length_penalty=length_penalty,
                     repetition_penalty=repetition_penalty,
                     top_k=top_k,
                     top_p=top_p,
-                    speed=speed,
-                    split_sentences=False  # Já dividimos manualmente
+                    speed=speed
                 )
                 
-            except AttributeError as e:
-                if "'GPT2InferenceModel' object has no attribute 'generate'" in str(e):
-                    logger.error("❌ Erro de compatibilidade detectado!")
-                    raise HTTPException(
-                        status_code=500, 
-                        detail="Erro de compatibilidade: Atualize para coqui-tts>=0.27.0 e transformers<=4.46.2"
+                if not success:
+                    logger.warning("⚠️ Método ultra-limpo falhou, usando método padrão...")
+                    # Fallback para método padrão se ultra-limpo falhar
+                    tts_model.tts_to_file(
+                        text=chunk_text,
+                        speaker_wav=ref_path,
+                        language=language,
+                        file_path=chunk_path,
+                        temperature=temperature,
+                        length_penalty=length_penalty,
+                        repetition_penalty=repetition_penalty,
+                        top_k=top_k,
+                        top_p=top_p,
+                        speed=speed,
+                        split_sentences=False
                     )
-                raise
-            
-            # Pós-processamento do chunk
-            current_chunk_path = chunk_path
-            
-            # Remover aquecimento se foi usado (apenas no primeiro chunk)
-            if use_warmup and i == 0 and warmup_word_count > 0:
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as trimmed_file:
-                    trimmed_path = trimmed_file.name
+            else:
+                # Método padrão para outros chunks
+                # Adicionar aquecimento apenas se for o primeiro chunk e método padrão
+                warmup_word_count = 0
+                if use_warmup and i == 0 and not ultra_clean_start:
+                    warmed_text, warmup_word_count = add_warmup_context(chunk_text, language)
+                    logger.info(f"🔥 Aquecimento adicionado ao primeiro chunk - {warmup_word_count} palavras")
+                    final_chunk_text = warmed_text
+                else:
+                    final_chunk_text = chunk_text
                 
+                # Síntese de voz com parâmetros conservadores
                 try:
-                    audio_data, sr = sf.read(current_chunk_path)
-                    if trim_warmup_from_audio(current_chunk_path, trimmed_path, warmup_word_count, sr):
-                        os.unlink(current_chunk_path)
-                        current_chunk_path = trimmed_path
-                        logger.info(f"🎬 Aquecimento removido do chunk {i+1}")
-                    else:
-                        os.unlink(trimmed_path)
-                except Exception as e:
-                    logger.warning(f"⚠️ Falha ao remover aquecimento do chunk {i+1}: {e}")
-                    os.unlink(trimmed_path)
+                    logger.info(f"🎤 Sintetizando chunk {i+1} com parâmetros conservadores...")
+                    
+                    tts_model.tts_to_file(
+                        text=final_chunk_text,
+                        speaker_wav=ref_path,
+                        language=language,
+                        file_path=chunk_path,
+                        temperature=temperature,
+                        length_penalty=length_penalty,
+                        repetition_penalty=repetition_penalty,
+                        top_k=top_k,
+                        top_p=top_p,
+                        speed=speed,
+                        split_sentences=False
+                    )
+                    
+                    # Remover aquecimento se foi usado
+                    if use_warmup and i == 0 and warmup_word_count > 0:
+                        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as trimmed_file:
+                            trimmed_path = trimmed_file.name
+                        
+                        try:
+                            audio_data, sr = sf.read(chunk_path)
+                            if trim_warmup_from_audio(chunk_path, trimmed_path, warmup_word_count, sr):
+                                os.unlink(chunk_path)
+                                chunk_path = trimmed_path
+                                logger.info(f"🎬 Aquecimento removido do chunk {i+1}")
+                            else:
+                                os.unlink(trimmed_path)
+                        except Exception as e:
+                            logger.warning(f"⚠️ Falha ao remover aquecimento do chunk {i+1}: {e}")
+                            if os.path.exists(trimmed_path):
+                                os.unlink(trimmed_path)
+                    
+                except AttributeError as e:
+                    if "'GPT2InferenceModel' object has no attribute 'generate'" in str(e):
+                        logger.error("❌ Erro de compatibilidade detectado!")
+                        raise HTTPException(
+                            status_code=500, 
+                            detail="Erro de compatibilidade: Atualize para coqui-tts>=0.27.0 e transformers<=4.46.2"
+                        )
+                    raise
             
             # Verificar se arquivo foi gerado corretamente
-            if not os.path.exists(current_chunk_path) or os.path.getsize(current_chunk_path) == 0:
+            if not os.path.exists(chunk_path) or os.path.getsize(chunk_path) == 0:
                 logger.error(f"❌ Falha na geração do chunk {i+1}")
                 continue
             
-            chunk_paths.append(current_chunk_path)
+            chunk_paths.append(chunk_path)
             logger.info(f"✅ Chunk {i+1} gerado com sucesso")
         
         if not chunk_paths:
