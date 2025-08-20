@@ -6,7 +6,7 @@ import torch
 import logging
 import time
 import gc
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from TTS.api import TTS
@@ -23,28 +23,73 @@ logger = logging.getLogger(__name__)
 # Variável global para o modelo
 tts_model = None
 
+def cleanup_file(file_path: str):
+    """Remove arquivo após envio"""
+    try:
+        if os.path.exists(file_path):
+            os.unlink(file_path)
+            logger.debug(f"🗑️ Arquivo removido após envio: {file_path}")
+    except Exception as e:
+        logger.warning(f"⚠️ Falha ao remover arquivo após envio {file_path}: {e}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     global tts_model
     logger.info("🚀 Iniciando servidor Coqui TTS...")
     
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    logger.info(f"📱 Dispositivo: {device}")
+    # Verificação detalhada de GPU
+    logger.info(f"🔍 PyTorch version: {torch.__version__}")
+    logger.info(f"🔍 CUDA compiled version: {torch.version.cuda}")
+    logger.info(f"🔍 CUDA available: {torch.cuda.is_available()}")
+    logger.info(f"🔍 CUDA device count: {torch.cuda.device_count()}")
     
     if torch.cuda.is_available():
-        logger.info(f"🎮 GPU: {torch.cuda.get_device_name(0)}")
-        logger.info(f"💾 VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
+        device = "cuda"
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        logger.info(f"📱 Dispositivo: {device}")
+        logger.info(f"🎮 GPU: {gpu_name}")
+        logger.info(f"💾 VRAM Total: {gpu_memory:.1f}GB")
+        
+        # Teste simples de GPU
+        try:
+            test_tensor = torch.randn(10, 10).cuda()
+            logger.info(f"✅ Teste de GPU bem-sucedido")
+            del test_tensor
+            torch.cuda.empty_cache()
+        except Exception as e:
+            logger.error(f"❌ Erro no teste de GPU: {e}")
+            device = "cpu"
+    else:
+        device = "cpu"
+        logger.warning("⚠️ GPU não disponível - usando CPU")
+        logger.info("📱 Dispositivo: cpu")
+        
+        # Dicas para resolver problema de GPU
+        logger.info("💡 Para usar GPU:")
+        logger.info("   - Certifique-se que nvidia-docker está instalado")
+        logger.info("   - Use: docker run --gpus all ...")
+        logger.info("   - Ou: nvidia-docker run ..."
     
     try:
         logger.info("📥 Carregando modelo XTTS-v2...")
         start_time = time.time()
         
+        # Forçar uso de GPU se disponível
+        use_gpu = torch.cuda.is_available()
+        logger.info(f"🎯 Carregando modelo com GPU: {use_gpu}")
+        
         # Carregar modelo com tratamento de erro melhorado
         tts_model = TTS(
             "tts_models/multilingual/multi-dataset/xtts_v2", 
-            gpu=torch.cuda.is_available()
+            gpu=use_gpu
         )
+        
+        # Verificar se modelo foi carregado na GPU
+        if use_gpu and hasattr(tts_model, 'synthesizer') and hasattr(tts_model.synthesizer, 'tts_model'):
+            model_device = next(tts_model.synthesizer.tts_model.parameters()).device
+            logger.info(f"🎯 Modelo carregado no dispositivo: {model_device}")
         
         load_time = time.time() - start_time
         logger.info(f"✅ Modelo carregado em {load_time:.2f}s!")
@@ -115,6 +160,7 @@ async def health_check():
 
 @app.post("/generate")
 async def generate_audio(
+    background_tasks: BackgroundTasks,
     text: str = Form(..., description="Texto para sintetizar"),
     reference_audio: UploadFile = File(..., description="Áudio de referência (.wav)"),
     language: str = Form("pt", description="Código do idioma"),
@@ -198,6 +244,9 @@ async def generate_audio(
         file_size = os.path.getsize(out_path)
         logger.info(f"✅ Áudio gerado em {generation_time:.2f}s - Tamanho: {file_size} bytes")
         
+        # Agendar limpeza do arquivo após envio
+        background_tasks.add_task(cleanup_file, out_path)
+        
         return FileResponse(
             out_path,
             media_type="audio/wav",
@@ -205,7 +254,8 @@ async def generate_audio(
             headers={
                 "X-Generation-Time": str(generation_time),
                 "X-File-Size": str(file_size)
-            }
+            },
+            background=lambda: os.unlink(out_path) if os.path.exists(out_path) else None
         )
         
     except HTTPException:
@@ -216,14 +266,14 @@ async def generate_audio(
         raise HTTPException(status_code=500, detail=f"Erro na síntese: {str(e)}")
     
     finally:
-        # Limpar arquivos temporários
-        for path in [ref_path, out_path]:
-            if path and os.path.exists(path):
-                try:
-                    os.unlink(path)
-                    logger.debug(f"🗑️ Arquivo temporário removido: {path}")
-                except Exception as e:
-                    logger.warning(f"⚠️ Falha ao remover arquivo temporário {path}: {e}")
+        # Limpar apenas arquivo de referência - out_path será auto-removido
+        if ref_path and os.path.exists(ref_path):
+            try:
+                os.unlink(ref_path)
+            except Exception as e:
+                logger.warning(f"⚠️ Falha ao remover arquivo de referência: {e}")
+        
+        # NOTA: out_path é removido automaticamente pelo FastAPI FileResponse
 
 @app.post("/batch")
 async def generate_batch(
