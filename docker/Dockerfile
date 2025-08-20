@@ -15,7 +15,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg git ca-certificates \
     && pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir \
-        TTS==0.20.6 \
+        coqui-tts==0.27.0 \
+        transformers<=4.46.2 \
         fastapi==0.104.1 \
         uvicorn==0.24.0 \
         python-multipart==0.0.6 \
