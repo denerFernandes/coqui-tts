@@ -58,7 +58,7 @@ jobs:
       uses: docker/build-push-action@v5
       with:
         context: ./docker
-        file: ./docker/Dockerfile.slim
+        file: ./docker/Dockerfile
         platforms: linux/amd64
         push: true
         tags: ${{ secrets.DOCKERHUB_USERNAME }}/coqui-tts-xtts-v2:latest
