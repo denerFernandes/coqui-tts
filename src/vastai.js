@@ -35,7 +35,7 @@ class VastAI {
       
       // Mostrar opções
       melhores.forEach((inst, i) => {
-        console.log(chalk.cyan(`   ${i + 1}. ${inst.gpu_name} - $${inst.min_bid}/h - ${inst.reliability*100}% confiável`));
+        console.log(chalk.cyan(`   ${i + 1}. ${inst.gpu_name} - ${inst.min_bid}/h - ${Math.round(inst.reliability*100)}% confiável`));
       });
       
       return melhores;
@@ -51,12 +51,18 @@ class VastAI {
       console.log(chalk.blue(`🚀 Criando instância com Docker...`));
 
       // Comando Docker para rodar na inicialização
-      const dockerCmd = `docker run -d --gpus all -p 8000:8000 --name coqui-tts ${config.vastai.dockerImage}`;
+      const dockerCmd = `
+        sleep 10 &&
+        docker pull ${config.vastai.dockerImage} &&
+        docker run -d --name coqui-tts --gpus all -p 8000:8000 --restart unless-stopped ${config.vastai.dockerImage} &&
+        sleep 30 &&
+        curl -f http://localhost:8000/health || echo "Aguardando servidor..."
+      `.replace(/\s+/g, ' ').trim();
       
       const response = await axios.post(`${this.apiUrl}/asks/${bundleId}`, {
         price: config.vastai.searchParams.max_price,
-        disk: 30, // Menor porque Docker cuida do ambiente
-        image: 'nvidia/cuda:11.8-runtime-ubuntu20.04', // Imagem base leve
+        disk: 25,
+        image: 'nvidia/cuda:12.1-runtime-ubuntu20.04',
         onstart: dockerCmd,
         env: {
           'NVIDIA_VISIBLE_DEVICES': 'all'
@@ -114,7 +120,7 @@ class VastAI {
       }
       
       console.log(chalk.yellow(`   ${i + 1}/${maxTentativas} - Status: ${status?.status || 'unknown'}`));
-      await this._sleep(8000); // 8 segundos (Docker precisa de tempo)
+      await this._sleep(8000); // 8 segundos
     }
     
     throw new Error('Timeout: Instância não ficou pronta');

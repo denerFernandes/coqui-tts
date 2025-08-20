@@ -1,0 +1,19 @@
+{
+  "referencia": "data/referencias/minha_voz.mp3",
+  "opcoes": {
+    "language": "pt",
+    "temperature": 0.75,
+    "length_penalty": 1.0,
+    "repetition_penalty": 1.0,
+    "top_k": 50,
+    "top_p": 0.85
+  },
+  "textos": [
+    "Olá! Este é um teste do sistema de síntese de voz em português brasileiro.",
+    "A qualidade do áudio gerado com XTTS-v2 é realmente impressionante.",
+    "Agora vou testar com um texto mais longo para verificar a consistência da voz clonada ao longo de frases mais elaboradas e complexas.",
+    "O sistema também funciona bem com números: hoje é dia 20 de agosto de 2025.",
+    "Pontuação é importante! Vírgulas criam pausas naturais... E exclamações dão ênfase!",
+    "Este é o último teste do nosso lote de áudios de exemplo."
+  ]
+}
