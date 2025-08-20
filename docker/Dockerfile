@@ -1,4 +1,4 @@
-FROM --platform=linux/amd64 nvidia/cuda:13.0.0-cudnn-devel-ubuntu22.04
+FROM nvidia/cuda:13.0.0-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
