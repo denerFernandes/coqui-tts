@@ -129,6 +129,35 @@ def remove_silence_from_audio(audio_path: str, output_path: str) -> bool:
         logger.warning(f"⚠️ Erro ao remover silêncios: {e}")
         return False
 
+def optimize_text_for_speech(text: str, language: str = "pt") -> str:
+    """Otimizar texto para melhor síntese de voz"""
+    # Adicionar pontuação para pausas naturais
+    text = text.strip()
+    
+    # Adicionar pontos finais se não houver
+    if not text.endswith(('.', '!', '?')):
+        text += '.'
+    
+    # Substituir abreviações comuns (português)
+    if language == "pt":
+        replacements = {
+            ' dr ': ' doutor ',
+            ' dra ': ' doutora ',
+            ' prof ': ' professor ',
+            ' sra ': ' senhora ',
+            ' sr ': ' senhor ',
+            'vc': 'você',
+            'pq': 'porque',
+            'td': 'tudo',
+            'tbm': 'também'
+        }
+        text_lower = text.lower()
+        for abbrev, full in replacements.items():
+            text = text.replace(abbrev, full)
+            text_lower = text_lower.replace(abbrev, full)
+    
+    return text
+
 def get_character_limits() -> dict:
     """Limites de caracteres por idioma para XTTS"""
     return {
