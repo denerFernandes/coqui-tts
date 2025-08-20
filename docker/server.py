@@ -158,6 +158,111 @@ def optimize_text_for_speech(text: str, language: str = "pt") -> str:
     
     return text
 
+def add_warmup_context(text: str, language: str = "pt") -> tuple:
+    """Adicionar contexto de aquecimento para melhorar início do áudio"""
+    warmup_texts = {
+        "pt": [
+            "Olá.",
+            "Bem-vindos.",
+            "Atenção por favor."
+        ],
+        "en": [
+            "Hello.",
+            "Welcome.",
+            "Attention please."
+        ],
+        "es": [
+            "Hola.",
+            "Bienvenidos.",
+            "Atención por favor."
+        ]
+    }
+    
+    # Selecionar frase de aquecimento baseada no idioma
+    warmup_phrase = warmup_texts.get(language, warmup_texts["en"])[0]
+    
+    # Criar texto com aquecimento
+    warmed_text = f"{warmup_phrase} {text}"
+    
+    # Calcular onde cortar o aquecimento no áudio final
+    warmup_word_count = len(warmup_phrase.split())
+    
+    return warmed_text, warmup_word_count
+
+def trim_warmup_from_audio(audio_path: str, output_path: str, warmup_word_count: int, sample_rate: int = 22050) -> bool:
+    """Remover o aquecimento do início do áudio"""
+    try:
+        audio_data, sr = sf.read(audio_path)
+        
+        # Estimar duração do aquecimento (aproximadamente 0.6s por palavra + 0.3s de pausa)
+        estimated_warmup_duration = (warmup_word_count * 0.6) + 0.3
+        warmup_samples = int(estimated_warmup_duration * sr)
+        
+        # Adicionar pequeno fade-in para evitar cliques
+        fade_samples = int(0.05 * sr)  # 50ms fade-in
+        
+        if warmup_samples < len(audio_data):
+            # Cortar aquecimento
+            trimmed_audio = audio_data[warmup_samples:]
+            
+            # Aplicar fade-in suave
+            if len(trimmed_audio) > fade_samples:
+                fade_curve = np.linspace(0, 1, fade_samples)
+                trimmed_audio[:fade_samples] *= fade_curve
+            
+            sf.write(output_path, trimmed_audio, sr)
+            logger.info(f"🎬 Aquecimento removido: {warmup_samples/sr:.2f}s cortados do início")
+            return True
+        else:
+            # Se estimativa foi errada, manter original
+            sf.write(output_path, audio_data, sr)
+            logger.warning("⚠️ Não foi possível remover aquecimento - mantendo áudio original")
+            return False
+            
+    except Exception as e:
+        logger.error(f"❌ Erro ao remover aquecimento: {e}")
+        return False
+
+def improve_audio_start(audio_path: str, output_path: str) -> bool:
+    """Melhorar qualidade do início do áudio"""
+    try:
+        audio_data, sr = sf.read(audio_path)
+        
+        # Parâmetros para melhoria do início
+        start_improvement_duration = 1.0  # primeiros 1 segundo
+        start_samples = int(start_improvement_duration * sr)
+        
+        if len(audio_data) > start_samples:
+            # Aplicar filtro suave no início para reduzir artefatos
+            start_segment = audio_data[:start_samples].copy()
+            
+            # Suavização com média móvel
+            window_size = int(0.01 * sr)  # janela de 10ms
+            if window_size > 1:
+                kernel = np.ones(window_size) / window_size
+                start_segment = np.convolve(start_segment, kernel, mode='same')
+            
+            # Aplicar fade-in muito suave
+            fade_samples = int(0.1 * sr)  # 100ms
+            if fade_samples < len(start_segment):
+                fade_curve = np.linspace(0.3, 1.0, fade_samples)  # começar em 30% do volume
+                start_segment[:fade_samples] *= fade_curve
+            
+            # Combinar início melhorado com resto do áudio
+            improved_audio = audio_data.copy()
+            improved_audio[:start_samples] = start_segment
+            
+            sf.write(output_path, improved_audio, sr)
+            logger.info("🎛️ Início do áudio melhorado")
+            return True
+        else:
+            sf.write(output_path, audio_data, sr)
+            return False
+            
+    except Exception as e:
+        logger.error(f"❌ Erro ao melhorar início do áudio: {e}")
+        return False
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
@@ -296,7 +401,9 @@ async def generate_audio(
     top_p: float = Form(0.85, description="Top-p sampling"),
     speed: float = Form(1.0, description="Velocidade da fala (0.8-1.2)"),
     enable_text_splitting: bool = Form(True, description="Dividir texto em sentenças"),
-    remove_silence: bool = Form(True, description="Remover silêncios excessivos")
+    remove_silence: bool = Form(True, description="Remover silêncios excessivos"),
+    improve_start: bool = Form(True, description="Melhorar qualidade do início do áudio"),
+    use_warmup: bool = Form(True, description="Usar aquecimento para melhorar início")
 ):
     if not tts_model:
         raise HTTPException(status_code=503, detail="Modelo não carregado")
@@ -341,6 +448,15 @@ async def generate_audio(
         if optimized_text != text:
             logger.info(f"📝 Texto otimizado para síntese")
         
+        # Adicionar aquecimento se habilitado
+        warmup_word_count = 0
+        if use_warmup:
+            warmed_text, warmup_word_count = add_warmup_context(optimized_text, language)
+            logger.info(f"🔥 Aquecimento adicionado - {warmup_word_count} palavras")
+            final_text = warmed_text
+        else:
+            final_text = optimized_text
+        
         # Salvar áudio de referência temporariamente
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as ref_file:
             content = await reference_audio.read()
@@ -368,7 +484,7 @@ async def generate_audio(
             logger.info(f"🎤 Iniciando síntese com parâmetros otimizados...")
             
             tts_model.tts_to_file(
-                text=optimized_text,
+                text=final_text,  # Usar texto com aquecimento se habilitado
                 speaker_wav=ref_path,
                 language=language,
                 file_path=out_path,
@@ -390,47 +506,81 @@ async def generate_audio(
                 )
             raise
         
-        # Pós-processamento: remover silêncios se solicitado
+        # Pós-processamento em etapas
+        current_path = out_path
+        processing_steps = []
+        
+        # Etapa 1: Remover aquecimento se foi usado
+        if use_warmup and warmup_word_count > 0:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as trimmed_file:
+                trimmed_path = trimmed_file.name
+            
+            try:
+                audio_data, sr = sf.read(current_path)
+                if trim_warmup_from_audio(current_path, trimmed_path, warmup_word_count, sr):
+                    os.unlink(current_path)
+                    current_path = trimmed_path
+                    processing_steps.append("aquecimento removido")
+                else:
+                    os.unlink(trimmed_path)
+            except Exception as e:
+                logger.warning(f"⚠️ Falha ao remover aquecimento: {e}")
+                os.unlink(trimmed_path)
+        
+        # Etapa 2: Melhorar início do áudio
+        if improve_start:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as improved_file:
+                improved_path = improved_file.name
+            
+            if improve_audio_start(current_path, improved_path):
+                os.unlink(current_path)
+                current_path = improved_path
+                processing_steps.append("início melhorado")
+            else:
+                os.unlink(improved_path)
+        
+        # Etapa 3: Remover silêncios se solicitado
         if remove_silence:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as processed_file:
                 processed_path = processed_file.name
             
-            if remove_silence_from_audio(out_path, processed_path):
-                # Usar áudio processado
-                os.unlink(out_path)
-                out_path = processed_path
-                logger.info("🎛️ Pós-processamento aplicado com sucesso")
+            if remove_silence_from_audio(current_path, processed_path):
+                os.unlink(current_path)
+                current_path = processed_path
+                processing_steps.append("silêncios removidos")
             else:
-                # Manter original se processamento falhou
                 os.unlink(processed_path)
-                logger.info("🎛️ Mantendo áudio original")
         
         # Verificar se o arquivo foi gerado
-        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        if not os.path.exists(current_path) or os.path.getsize(current_path) == 0:
             raise HTTPException(status_code=500, detail="Falha na geração do áudio")
         
         generation_time = time.time() - start_time
-        file_size = os.path.getsize(out_path)
+        file_size = os.path.getsize(current_path)
         
         # Informações do áudio gerado
         try:
-            final_audio, final_sr = sf.read(out_path)
+            final_audio, final_sr = sf.read(current_path)
             final_duration = len(final_audio) / final_sr
             logger.info(f"✅ Áudio gerado em {generation_time:.2f}s - Tamanho: {file_size} bytes - Duração: {final_duration:.1f}s")
+            if processing_steps:
+                logger.info(f"🎛️ Pós-processamento aplicado: {', '.join(processing_steps)}")
         except:
             logger.info(f"✅ Áudio gerado em {generation_time:.2f}s - Tamanho: {file_size} bytes")
         
         return FileResponse(
-            out_path,
+            current_path,
             media_type="audio/wav",
             filename=f"generated_{int(time.time())}.wav",
             headers={
                 "X-Generation-Time": str(generation_time),
                 "X-File-Size": str(file_size),
                 "X-Audio-Duration": str(final_duration) if 'final_duration' in locals() else "unknown",
-                "X-Processed": "true" if remove_silence else "false"
+                "X-Processing-Steps": ",".join(processing_steps) if processing_steps else "none",
+                "X-Warmup-Used": "true" if use_warmup else "false",
+                "X-Start-Improved": "true" if improve_start else "false"
             },
-            background=lambda: os.unlink(out_path) if os.path.exists(out_path) else None
+            background=lambda: os.unlink(current_path) if os.path.exists(current_path) else None
         )
         
     except HTTPException:
@@ -467,28 +617,45 @@ async def generate_audio_preset(
             "repetition_penalty": 7.0,
             "speed": 1.1,
             "remove_silence": True,
-            "enable_text_splitting": True
+            "enable_text_splitting": True,
+            "improve_start": True,
+            "use_warmup": True
         },
         "balanced": {
             "temperature": 0.85,
             "repetition_penalty": 5.0,
             "speed": 1.0,
             "remove_silence": True,
-            "enable_text_splitting": True
+            "enable_text_splitting": True,
+            "improve_start": True,
+            "use_warmup": True
         },
         "calm": {
             "temperature": 0.80,
             "repetition_penalty": 3.0,
             "speed": 0.95,
             "remove_silence": False,
-            "enable_text_splitting": True
+            "enable_text_splitting": True,
+            "improve_start": True,
+            "use_warmup": False
         },
         "expressive": {
             "temperature": 0.95,
             "repetition_penalty": 8.0,
             "speed": 1.05,
             "remove_silence": True,
-            "enable_text_splitting": False
+            "enable_text_splitting": False,
+            "improve_start": True,
+            "use_warmup": True
+        },
+        "professional": {
+            "temperature": 0.87,
+            "repetition_penalty": 6.0,
+            "speed": 1.0,
+            "remove_silence": True,
+            "enable_text_splitting": True,
+            "improve_start": True,
+            "use_warmup": True
         }
     }
     
@@ -510,7 +677,9 @@ async def generate_audio_preset(
         top_p=0.85,
         speed=config["speed"],
         enable_text_splitting=config["enable_text_splitting"],
-        remove_silence=config["remove_silence"]
+        remove_silence=config["remove_silence"],
+        improve_start=config["improve_start"],
+        use_warmup=config["use_warmup"]
     )
 
 @app.get("/audio-tips")
@@ -536,14 +705,24 @@ async def get_audio_tips():
             "temperature": "0.85-0.95 para voz mais expressiva",
             "repetition_penalty": "5.0-8.0 para evitar repetições",
             "speed": "1.0-1.1 para voz mais dinâmica",
-            "remove_silence": "true para áudio mais limpo"
+            "remove_silence": "true para áudio mais limpo",
+            "improve_start": "true para melhorar qualidade do início",
+            "use_warmup": "true para eliminar problemas no início do áudio"
         },
         "presets": {
-            "energetic": "Voz animada e dinâmica",
+            "energetic": "Voz animada e dinâmica com início otimizado",
             "balanced": "Equilíbrio entre naturalidade e expressividade",
             "calm": "Voz mais suave e relaxada",
-            "expressive": "Máxima expressividade e emoção"
-        }
+            "expressive": "Máxima expressividade e emoção",
+            "professional": "Ideal para narrações e apresentações corporativas"
+        },
+        "start_quality_tips": [
+            "Use 'use_warmup=true' para melhorar drasticamente o início",
+            "Combine com 'improve_start=true' para máxima qualidade",
+            "O aquecimento adiciona contexto que melhora a síntese",
+            "O processamento remove automaticamente o aquecimento",
+            "Resultado: início limpo e de alta qualidade"
+        ]
     }
 async def generate_batch(
     texts: list[str] = Form(..., description="Lista de textos"),
