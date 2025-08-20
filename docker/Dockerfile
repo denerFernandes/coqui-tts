@@ -32,7 +32,7 @@ RUN pip install -r requirements.txt
 
 COPY --chown=coqui:coqui server.py .
 
-RUN python -c "from TTS.api import TTS; print('Baixando XTTS-v2...'); TTS('tts_models/multilingual/multi-dataset/xtts_v2', gpu=False); print('Modelo baixado!')"
+RUN echo "y" | python -c "from TTS.api import TTS; TTS('tts_models/multilingual/multi-dataset/xtts_v2', gpu=False)" || true
 
 EXPOSE 8000
 CMD ["python", "server.py"]
