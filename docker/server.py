@@ -262,7 +262,7 @@ def optimize_text_for_speech(text: str, language: str = "pt") -> str:
     text = re.sub(r'([.!?,:;])([A-Za-z])', r'\1 \2', text)
     
     # Remover pontuação redundante no final
-    text = re.sub(r'[.!?]+
+    text = re.sub(r'[.!?]+$', '', text).strip()
 
 def get_character_limits() -> dict:
     """Limites de caracteres por idioma para XTTS"""
