@@ -239,7 +239,7 @@ async def generate_audio(
             top_k=top_k,
             top_p=top_p,
             speed=speed,
-            split_sentences=enable_text_splitting  # Deixa o XTTS dividir automaticamente
+            split_sentences=enable_text_splitting,
             text_cleaner="portuguese_cleaner"
         )
         
