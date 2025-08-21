@@ -225,6 +225,17 @@ async def generate_audio(
             output_path = output_file.name
         
         logger.info("🎤 Gerando áudio com streaming...")
+
+        # Remover pontos duplos, triplos, etc
+        text = re.sub(r'\.{2,}', '.', text)
+
+        # Substituir pontos seguidos de espaço por pausa
+        text = re.sub(r'\.\s+', '. ', text)
+
+        # Substituir pontos por símbolos alternativos que o TTS entende melhor
+        text = text.replace('.', ' ')  # Remove pontos totalmente
+        text = text.replace('.', ',')  # Transforma pontos em vírgulas
+        text = text.replace('...', ' pausa longa ')  # Reticências explícitas
         
         # Usar split_sentences=True para textos grandes (streaming interno do XTTS)
         tts_model.tts_to_file(
