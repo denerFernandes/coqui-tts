@@ -149,7 +149,7 @@ def clean_text_for_portuguese_tts(text):
     
     # Números decimais
     text = re.sub(r'(\d+)\.(\d+)', r'\1 vírgula \2', text)
-    text = text.replace('.', '')
+    text = text.replace('.', ';\n')
     
     return text
 
@@ -244,8 +244,6 @@ async def generate_audio(
             output_path = output_file.name
         
         logger.info("🎤 Gerando áudio com streaming...")
-
-        text = text.replace('.', '')
 
         # Usar split_sentences=True para textos grandes (streaming interno do XTTS)
         tts_model.tts_to_file(
