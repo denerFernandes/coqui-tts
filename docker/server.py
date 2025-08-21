@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from TTS.api import TTS
 from contextlib import asynccontextmanager
 from pathlib import Path
+from TTS.tts.utils.text.cleaners import portuguese_cleaners
 
 # Configurar logging
 logging.basicConfig(
@@ -229,7 +230,7 @@ async def generate_audio(
         
         # Usar split_sentences=True para textos grandes (streaming interno do XTTS)
         tts_model.tts_to_file(
-            text=text.strip(),
+            text=portuguese_cleaner(text.strip()),
             speaker_wav=processed_ref_path,
             language=language,
             file_path=output_path,
@@ -239,8 +240,7 @@ async def generate_audio(
             top_k=top_k,
             top_p=top_p,
             speed=speed,
-            split_sentences=enable_text_splitting,
-            text_cleaner="portuguese_cleaner"
+            split_sentences=enable_text_splitting
         )
         
         # 4. Pós-processar para áudio limpo (44.1kHz estéreo)
