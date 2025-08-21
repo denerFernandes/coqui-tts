@@ -135,6 +135,24 @@ async def lifespan(app: FastAPI):
         torch.cuda.empty_cache()
     gc.collect()
 
+def clean_text_for_portuguese_tts(text):
+    from TTS.tts.utils.text.cleaners import portuguese_cleaners
+    import re
+    
+    # Expandir abreviações
+    abbrevs = {"Dr.": "Doutor", "Dra.": "Doutora", "Sr.": "Senhor", "Sra.": "Senhora"}
+    for old, new in abbrevs.items():
+        text = text.replace(old, new)
+    
+    # Aplicar cleaner português
+    text = portuguese_cleaners(text)
+    
+    # Números decimais
+    text = re.sub(r'(\d+)\.(\d+)', r'\1 vírgula \2', text)
+    text = text.replace('.', '')
+    
+    return text
+
 # Criar app FastAPI
 app = FastAPI(
     title="Coqui TTS Server",
@@ -231,7 +249,7 @@ async def generate_audio(
 
         # Usar split_sentences=True para textos grandes (streaming interno do XTTS)
         tts_model.tts_to_file(
-            text=portuguese_cleaner(text.strip()),
+            text=clean_text_for_portuguese_tts(text.strip()),
             speaker_wav=processed_ref_path,
             language=language,
             file_path=output_path,
