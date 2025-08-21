@@ -36,6 +36,7 @@ RUN pip install soundfile==0.13.1
 RUN pip install numpy==1.24.3
 RUN pip install scipy==1.10.1
 RUN pip install requests==2.31.0
+RUN pip install pydub==0.25.1
 
 # Pre-download do modelo (opcional - comentar se quiser baixar no startup)
 RUN echo "y" | python -c "from TTS.api import TTS; TTS('tts_models/multilingual/multi-dataset/xtts_v2', gpu=False)" || true
