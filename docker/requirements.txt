@@ -10,4 +10,5 @@ torchvision>=0.15.0
 soundfile==0.13.1
 scipy>=1.7.0
 requests==2.31.0
+pydub>=0.25.1
 
