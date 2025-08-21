@@ -227,7 +227,8 @@ async def generate_audio(
         
         logger.info("🎤 Gerando áudio com streaming...")
 
-        
+        text = text.replace('.', '')
+
         # Usar split_sentences=True para textos grandes (streaming interno do XTTS)
         tts_model.tts_to_file(
             text=portuguese_cleaner(text.strip()),
