@@ -250,6 +250,7 @@ async def generate_audio(
             top_p=top_p,
             speed=speed,
             split_sentences=enable_text_splitting  # Deixa o XTTS dividir automaticamente
+            text_cleaner="portuguese_cleaner"
         )
         
         # 4. Pós-processar para áudio limpo (44.1kHz estéreo)
