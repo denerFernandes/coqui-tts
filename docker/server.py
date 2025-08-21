@@ -250,7 +250,7 @@ def optimize_text_for_speech(text: str, language: str = "pt") -> str:
 def get_character_limits() -> dict:
     """Limites de caracteres por idioma para XTTS"""
     return {
-        "pt": 200,  # Português - limite conservador para melhor qualidade
+        "pt": 160,  # Português - limite conservador para melhor qualidade
         "en": 250,  # Inglês
         "es": 220,  # Espanhol
         "fr": 230,  # Francês
@@ -272,7 +272,7 @@ def smart_text_split(text: str, language: str = "pt", max_chars: int = None) -> 
     """Dividir texto inteligentemente respeitando limites por idioma"""
     limits = get_character_limits()
     if max_chars is None:
-        max_chars = limits.get(language, 200)
+        max_chars = limits.get(language, 160)
     
     # Se texto está dentro do limite, retornar como está
     if len(text) <= max_chars:
@@ -674,7 +674,7 @@ async def generate_audio_v2(
         
         # 4. Dividir texto em chunks se necessário
         char_limits = get_character_limits()
-        char_limit = char_limits.get(language, 200)
+        char_limit = char_limits.get(language, 160)
         
         if len(optimized_text) > char_limit:
             text_chunks = smart_text_split(optimized_text, language, char_limit)
@@ -704,7 +704,7 @@ async def generate_audio_v2(
                 top_k=top_k,
                 top_p=top_p,
                 speed=speed,
-                split_sentences=True if len(chunk_text) > 200 else False  # Split automático para textos longos
+                split_sentences=True if len(chunk_text) > 160 else False  # Split automático para textos longos
             )
             
             # Verificar se arquivo foi gerado corretamente
@@ -867,7 +867,7 @@ async def generate_audio(
         
         # Verificar limite de caracteres
         char_limits = get_character_limits()
-        char_limit = char_limits.get(language, 200)
+        char_limit = char_limits.get(language, 160)
         if max_chars_per_chunk > 0:
             char_limit = min(char_limit, max_chars_per_chunk)
         
