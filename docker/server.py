@@ -182,6 +182,7 @@ def clean_text_for_portuguese_tts(text):
     # Números decimais
     text = re.sub(r'(\d+)\.(\d+)', r'\1 vírgula \2', text)
     text = text.replace('.', ';\n')
+    text = text.replace('-', ' ')
     
     return text
 
